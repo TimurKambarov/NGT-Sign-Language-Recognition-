@@ -123,16 +123,8 @@ pip install -r requirements.txt
 
 ## Usage
 
-### Basic Hand Detection
-
 ```bash
-python hand_detection.py
-```
-
-### Hand + Face Detection (with signing zone)
-
-```bash
-python hand_face_detection.py
+python main.py
 ```
 
 ## NGT Alphabet Reference
