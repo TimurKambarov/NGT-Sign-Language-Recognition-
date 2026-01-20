@@ -1,6 +1,6 @@
 # Core Computer Vision & MediaPipe
 opencv-python==4.9.0.80
-mediapipe==0.10.9
+mediapipe==0.10.30
 
 # Machine Learning
 scikit-learn==1.4.0
