@@ -94,7 +94,7 @@ Basic hand + face detection script that:
 
 ```bash
 # Clone the repository
-git clone https://github.com/TimurKambarov/ngt-sign-language.git
+git clone https://github.com/TimurKambarov/NGT-Sign-Language-Recognition-.git
 cd ngt-sign-language
 
 # Create virtual environment
