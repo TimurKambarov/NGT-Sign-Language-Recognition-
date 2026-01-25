@@ -1,0 +1,756 @@
+"""
+NGT Sign Language Recognition - COMBINED SYSTEM
+===============================================
+Combines:
+- Random Forest for STATIC letters (A-G, I, K-Y) [Teammate's model]
+- DTW for DYNAMIC letters (H, J, Z) [Our system]
+
+How it works:
+1. Detect hand
+2. Check if hand is MOVING or STILL
+3. STILL → Random Forest (static letters)
+4. MOVING → Record movement → DTW comparison (dynamic letters)
+
+Controls:
+    Q = Quit
+    M = Toggle mirror
+    Z = Toggle signing zone
+    D = Debug mode
+"""
+
+import cv2
+import numpy as np
+import os
+from collections import deque
+from scipy.spatial.distance import euclidean
+
+# Try imports
+try:
+    import joblib
+    JOBLIB_AVAILABLE = True
+except ImportError:
+    JOBLIB_AVAILABLE = False
+    print("Warning: joblib not installed. Static letter recognition disabled.")
+
+try:
+    from fastdtw import fastdtw
+    FASTDTW_AVAILABLE = True
+except ImportError:
+    FASTDTW_AVAILABLE = False
+    print("Warning: fastdtw not installed. Dynamic letter recognition disabled.")
+
+try:
+    import hand_face_detection as detection
+    DETECTION_MODULE_AVAILABLE = True
+except ImportError:
+    DETECTION_MODULE_AVAILABLE = False
+    print("Warning: hand_face_detection module not found. Using basic detection.")
+
+import mediapipe as mp
+
+# ============== CONFIGURATION ==============
+
+# Paths
+STATIC_MODEL_PATH = "models/random_forest.joblib"
+DYNAMIC_TEMPLATES_DIR = "data/dynamic"
+
+# Static letters (Random Forest)
+STATIC_LETTERS = list("ABCDEFGIKLMNOPQRSTUVWXY")
+
+# Dynamic letters (DTW)
+DYNAMIC_LETTERS = ['H', 'J', 'Z']
+
+# Movement detection
+MOVEMENT_THRESHOLD = 0.015      # Movement to consider "moving"
+STILLNESS_THRESHOLD = 0.008    # Below this = "still"
+STILLNESS_FRAMES = 15          # Frames of stillness before static prediction
+MOVEMENT_FRAMES = 5            # Frames of movement before recording dynamic
+
+# Dynamic gesture settings
+MIN_DYNAMIC_FRAMES = 15
+MAX_DYNAMIC_FRAMES = 150
+DTW_THRESHOLD = 35.0
+MIN_DTW_CONFIDENCE = 0.90      # 90% confidence for dynamic
+
+# Static prediction settings
+STATIC_CONFIDENCE_THRESHOLD = 0.60
+STABILITY_THRESHOLD = 10       # Frames for stable prediction
+
+# Colors
+COLOR_GREEN = (0, 255, 0)
+COLOR_RED = (0, 0, 255)
+COLOR_YELLOW = (0, 255, 255)
+COLOR_WHITE = (255, 255, 255)
+COLOR_CYAN = (255, 255, 0)
+COLOR_ORANGE = (0, 165, 255)
+COLOR_MAGENTA = (255, 0, 255)
+
+# ============== MEDIAPIPE SETUP ==============
+
+mp_hands = mp.solutions.hands
+mp_drawing = mp.solutions.drawing_utils
+
+hands = mp_hands.Hands(
+    static_image_mode=False,
+    max_num_hands=1,
+    model_complexity=1,
+    min_detection_confidence=0.4,
+    min_tracking_confidence=0.4
+)
+
+# ============== HELPER FUNCTIONS ==============
+
+def extract_landmarks_static(hand_landmarks):
+    """Extract 42 values (21 × 2) for static model - matches teammate's format"""
+    landmarks = []
+    wrist = hand_landmarks.landmark[0]
+    for lm in hand_landmarks.landmark:
+        landmarks.append(lm.x - wrist.x)
+        landmarks.append(lm.y - wrist.y)
+    return np.array(landmarks).reshape(1, -1)
+
+
+def extract_landmarks_dynamic(hand_landmarks):
+    """Extract 66 values for dynamic DTW - our format with absolute wrist"""
+    landmarks = []
+    wrist = hand_landmarks.landmark[0]
+    
+    # Absolute wrist position
+    landmarks.extend([wrist.x, wrist.y, wrist.z])
+    
+    # All landmarks relative to wrist
+    for lm in hand_landmarks.landmark:
+        landmarks.extend([lm.x - wrist.x, lm.y - wrist.y, lm.z - wrist.z])
+    
+    return np.array(landmarks, dtype=np.float32)
+
+
+def get_fingertip_positions(hand_landmarks):
+    """Get fingertip positions for movement detection"""
+    tips = [4, 8, 12, 16, 20]
+    positions = []
+    for tip in tips:
+        lm = hand_landmarks.landmark[tip]
+        positions.extend([lm.x, lm.y])
+    return np.array(positions)
+
+
+# ============== MODEL LOADERS ==============
+
+def load_static_model():
+    """Load Random Forest model for static letters"""
+    if not JOBLIB_AVAILABLE:
+        return None
+    
+    if not os.path.exists(STATIC_MODEL_PATH):
+        print(f"Static model not found: {STATIC_MODEL_PATH}")
+        return None
+    
+    model = joblib.load(STATIC_MODEL_PATH)
+    print(f"✓ Static model loaded: {STATIC_MODEL_PATH}")
+    return model
+
+
+def load_dynamic_templates():
+    """Load DTW templates for dynamic letters"""
+    if not FASTDTW_AVAILABLE:
+        return {}
+    
+    templates = {'H': [], 'J': [], 'Z': []}
+    
+    for letter in DYNAMIC_LETTERS:
+        letter_dir = os.path.join(DYNAMIC_TEMPLATES_DIR, letter)
+        if os.path.exists(letter_dir):
+            for f in os.listdir(letter_dir):
+                if f.endswith('.npy'):
+                    data = np.load(os.path.join(letter_dir, f))
+                    templates[letter].append(data)
+    
+    total = sum(len(t) for t in templates.values())
+    if total > 0:
+        print(f"✓ Dynamic templates loaded:")
+        for letter, temps in templates.items():
+            print(f"   {letter}: {len(temps)} samples")
+    else:
+        print("⚠ No dynamic templates found in data/dynamic/")
+    
+    return templates
+
+
+# ============== RECOGNIZERS ==============
+
+def predict_static(model, hand_landmarks):
+    """Predict static letter using Random Forest"""
+    if model is None:
+        return None, 0.0
+    
+    try:
+        features = extract_landmarks_static(hand_landmarks)
+        prediction = model.predict(features)[0]
+        probabilities = model.predict_proba(features)[0]
+        confidence = probabilities.max()
+        return prediction, confidence
+    except Exception as e:
+        return None, 0.0
+
+
+def compare_dynamic(frames, templates):
+    """Compare recorded frames with dynamic templates using DTW"""
+    if not FASTDTW_AVAILABLE or len(frames) < MIN_DYNAMIC_FRAMES:
+        return None, float('inf'), 0.0
+    
+    user_seq = np.array(frames)
+    
+    # Normalize
+    mean = np.mean(user_seq, axis=0)
+    std = np.std(user_seq)
+    if std > 0.001:
+        user_norm = (user_seq - mean) / std
+    else:
+        user_norm = user_seq - mean
+    
+    best_letter = None
+    best_distance = float('inf')
+    
+    for letter, letter_templates in templates.items():
+        for template in letter_templates:
+            # Normalize template
+            t_mean = np.mean(template, axis=0)
+            t_std = np.std(template)
+            if t_std > 0.001:
+                t_norm = (template - t_mean) / t_std
+            else:
+                t_norm = template - t_mean
+            
+            try:
+                distance, _ = fastdtw(t_norm, user_norm, dist=euclidean)
+                normalized = distance / (len(template) + len(frames))
+                
+                if normalized < best_distance:
+                    best_distance = normalized
+                    best_letter = letter
+            except:
+                continue
+    
+    # Calculate confidence
+    if best_distance < DTW_THRESHOLD:
+        confidence = 1 - (best_distance / DTW_THRESHOLD)
+    else:
+        confidence = 0.0
+    
+    if confidence >= MIN_DTW_CONFIDENCE:
+        return best_letter, best_distance, confidence
+    
+    return None, best_distance, confidence
+
+
+# ============== STATE MACHINE ==============
+
+class GestureRecognizer:
+    """
+    State machine:
+    
+    IDLE → DETECTING_MOTION → STATIC_PREDICT (if still)
+                            → RECORDING_DYNAMIC (if moving) → DYNAMIC_PREDICT
+    """
+    
+    def __init__(self, static_model, dynamic_templates):
+        self.static_model = static_model
+        self.dynamic_templates = dynamic_templates
+        
+        self.state = "IDLE"
+        self.prev_positions = None
+        self.motion_history = deque(maxlen=10)
+        
+        # Counters
+        self.stillness_count = 0
+        self.movement_count = 0
+        
+        # Recording
+        self.dynamic_frames = []
+        
+        # Prediction
+        self.static_stabilizer = deque(maxlen=STABILITY_THRESHOLD)
+        self.last_result = None
+        self.last_confidence = 0.0
+        self.result_type = None  # "static" or "dynamic"
+        self.result_timer = 0
+    
+    def calculate_motion(self, positions):
+        """Calculate smoothed motion"""
+        if self.prev_positions is None:
+            self.prev_positions = positions
+            return 0.0
+        
+        motion = np.sqrt(np.sum((positions - self.prev_positions) ** 2))
+        self.prev_positions = positions.copy()
+        self.motion_history.append(motion)
+        
+        return np.mean(self.motion_history) if self.motion_history else 0.0
+    
+    def process(self, hand_landmarks):
+        """Process one frame, return (state, result, confidence, result_type)"""
+        positions = get_fingertip_positions(hand_landmarks)
+        motion = self.calculate_motion(positions)
+        
+        # Handle result display timer
+        if self.result_timer > 0:
+            self.result_timer -= 1
+            return self.state, self.last_result, self.last_confidence, self.result_type
+        
+        # State machine
+        if self.state == "IDLE":
+            if motion > MOVEMENT_THRESHOLD:
+                self.movement_count += 1
+                self.stillness_count = 0
+                if self.movement_count >= MOVEMENT_FRAMES:
+                    self.state = "RECORDING_DYNAMIC"
+                    self.dynamic_frames = []
+            elif motion < STILLNESS_THRESHOLD:
+                self.stillness_count += 1
+                self.movement_count = 0
+                if self.stillness_count >= STILLNESS_FRAMES:
+                    self.state = "STATIC_PREDICT"
+            else:
+                self.movement_count = 0
+                self.stillness_count = 0
+        
+        elif self.state == "STATIC_PREDICT":
+            # Predict static letter
+            letter, confidence = predict_static(self.static_model, hand_landmarks)
+            
+            if letter and confidence >= STATIC_CONFIDENCE_THRESHOLD:
+                self.static_stabilizer.append((letter, confidence))
+                
+                # Check stability
+                if len(self.static_stabilizer) == STABILITY_THRESHOLD:
+                    letters = [p[0] for p in self.static_stabilizer]
+                    if all(l == letters[0] for l in letters):
+                        self.last_result = letters[0]
+                        self.last_confidence = np.mean([p[1] for p in self.static_stabilizer])
+                        self.result_type = "static"
+                        self.result_timer = 45
+            
+            # Check if started moving
+            if motion > MOVEMENT_THRESHOLD:
+                self.state = "RECORDING_DYNAMIC"
+                self.dynamic_frames = []
+                self.static_stabilizer.clear()
+        
+        elif self.state == "RECORDING_DYNAMIC":
+            # Record frame
+            landmarks = extract_landmarks_dynamic(hand_landmarks)
+            self.dynamic_frames.append(landmarks)
+            
+            # Check if stopped moving
+            if motion < STILLNESS_THRESHOLD:
+                self.stillness_count += 1
+            else:
+                self.stillness_count = 0
+            
+            # Check stop conditions
+            if self.stillness_count >= STILLNESS_FRAMES:
+                if len(self.dynamic_frames) >= MIN_DYNAMIC_FRAMES:
+                    # Recognize dynamic gesture
+                    letter, distance, confidence = compare_dynamic(
+                        self.dynamic_frames, self.dynamic_templates
+                    )
+                    
+                    if letter:
+                        self.last_result = letter
+                        self.last_confidence = confidence
+                        self.result_type = "dynamic"
+                        self.result_timer = 60
+                
+                self.state = "IDLE"
+                self.dynamic_frames = []
+                self.stillness_count = 0
+            
+            elif len(self.dynamic_frames) >= MAX_DYNAMIC_FRAMES:
+                self.state = "IDLE"
+                self.dynamic_frames = []
+        
+        return self.state, self.last_result if self.result_timer > 0 else None, \
+               self.last_confidence, self.result_type
+    
+    def get_motion(self):
+        return np.mean(self.motion_history) if self.motion_history else 0.0
+    
+    def get_dynamic_frames_count(self):
+        return len(self.dynamic_frames)
+    
+    def reset(self):
+        self.state = "IDLE"
+        self.dynamic_frames = []
+        self.static_stabilizer.clear()
+        self.stillness_count = 0
+        self.movement_count = 0
+
+
+# ============== DRAWING ==============
+
+def draw_hand(frame, hand_landmarks):
+    """Draw hand with colored fingertips"""
+    h, w = frame.shape[:2]
+    
+    mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS,
+        mp_drawing.DrawingSpec(color=(0, 180, 0), thickness=2, circle_radius=2),
+        mp_drawing.DrawingSpec(color=(0, 150, 0), thickness=2))
+    
+    fingertips = {4: COLOR_ORANGE, 8: COLOR_GREEN, 12: (255, 100, 0),
+                  16: COLOR_YELLOW, 20: COLOR_MAGENTA}
+    
+    for idx, color in fingertips.items():
+        tip = hand_landmarks.landmark[idx]
+        x, y = int(tip.x * w), int(tip.y * h)
+        cv2.circle(frame, (x, y), 8, color, -1)
+    
+    return frame
+
+
+def draw_ui(frame, state, motion, result, confidence, result_type, dynamic_frames, debug):
+    """Draw UI overlay"""
+    h, w = frame.shape[:2]
+    
+    # Top panel
+    cv2.rectangle(frame, (0, 0), (w, 100), (0, 0, 0), -1)
+    
+    # State indicator
+    if state == "IDLE":
+        state_color = COLOR_WHITE
+        state_text = "Waiting for hand..."
+    elif state == "STATIC_PREDICT":
+        state_color = COLOR_CYAN
+        state_text = "Detecting STATIC letter..."
+    elif state == "RECORDING_DYNAMIC":
+        state_color = COLOR_RED
+        state_text = f"Recording DYNAMIC gesture ({dynamic_frames} frames)"
+    else:
+        state_color = COLOR_WHITE
+        state_text = state
+    
+    cv2.putText(frame, state_text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, state_color, 2)
+    
+    # Mode indicator
+    cv2.putText(frame, "STATIC: A-Y (still) | DYNAMIC: H,J,Z (moving)", (20, 75),
+               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+    
+    # Result display
+    if result:
+        box_x, box_y = w - 220, 120
+        
+        if result_type == "dynamic":
+            box_color = (0, 100, 0)
+            border_color = COLOR_GREEN
+            label = "DYNAMIC"
+        else:
+            box_color = (100, 50, 0)
+            border_color = COLOR_CYAN
+            label = "STATIC"
+        
+        cv2.rectangle(frame, (box_x, box_y), (box_x + 200, box_y + 150), box_color, -1)
+        cv2.rectangle(frame, (box_x, box_y), (box_x + 200, box_y + 150), border_color, 3)
+        
+        cv2.putText(frame, label, (box_x + 60, box_y + 25),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, border_color, 1)
+        cv2.putText(frame, result, (box_x + 60, box_y + 100),
+                   cv2.FONT_HERSHEY_SIMPLEX, 3, border_color, 5)
+        cv2.putText(frame, f"{confidence:.0%}", (box_x + 75, box_y + 135),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2)
+    
+    # Debug
+    if debug:
+        cv2.putText(frame, f"Motion: {motion:.4f}", (20, h - 60),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+        cv2.putText(frame, f"Move thresh: {MOVEMENT_THRESHOLD} | Still thresh: {STILLNESS_THRESHOLD}",
+                   (20, h - 40), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1)
+    
+    # Controls
+    cv2.rectangle(frame, (0, h - 25), (w, h), (30, 30, 30), -1)
+    cv2.putText(frame, "Q=Quit | M=Mirror | D=Debug", (20, h - 8),
+               cv2.FONT_HERSHEY_SIMPLEX, 0.45, (150, 150, 150), 1)
+    
+    return frame
+
+
+# ============== MAIN ==============
+
+def main():
+    print("\n" + "="*60)
+    print("   NGT COMBINED RECOGNITION SYSTEM")
+    print("   Static (A-Y) + Dynamic (H, J, Z)")
+    print("="*60)
+    
+    # Load models
+    print("\nLoading models...")
+    static_model = load_static_model()
+    dynamic_templates = load_dynamic_templates()
+    
+    has_static = static_model is not None
+    has_dynamic = sum(len(t) for t in dynamic_templates.values()) > 0
+    
+    if not has_static and not has_dynamic:
+        print("\n❌ No models available!")
+        print("   - For static: Run train_model.ipynb")
+        print("   - For dynamic: Run record_simple.py")
+        return
+    
+    print(f"\n✓ Static letters: {'ENABLED' if has_static else 'DISABLED'}")
+    print(f"✓ Dynamic letters: {'ENABLED' if has_dynamic else 'DISABLED'}")
+    
+    # Initialize
+    recognizer = GestureRecognizer(static_model, dynamic_templates)
+    
+    cap = cv2.VideoCapture(0)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    
+    mirror_mode = True
+    debug_mode = False
+    
+    print("\n" + "="*60)
+    print("Controls:")
+    print("  Q = Quit")
+    print("  M = Toggle mirror")
+    print("  D = Toggle debug")
+    print("="*60)
+    print("\nReady! Show your hand...\n")
+    
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        
+        if mirror_mode:
+            frame = cv2.flip(frame, 1)
+        
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = hands.process(rgb)
+        
+        state = "IDLE"
+        result = None
+        confidence = 0
+        result_type = None
+        motion = 0
+        dynamic_frames = 0
+        
+        if results.multi_hand_landmarks:
+            hand_lm = results.multi_hand_landmarks[0]
+            frame = draw_hand(frame, hand_lm)
+            
+            state, result, confidence, result_type = recognizer.process(hand_lm)
+            motion = recognizer.get_motion()
+            dynamic_frames = recognizer.get_dynamic_frames_count()
+            
+            if result:
+                print(f"✓ Recognized: {result} ({result_type}, {confidence:.0%})")
+        else:
+            recognizer.reset()
+        
+        frame = draw_ui(frame, state, motion, result, confidence, result_type,
+                       dynamic_frames, debug_mode)
+        
+        # Hand indicator
+        h, w = frame.shape[:2]
+        indicator = COLOR_GREEN if results.multi_hand_landmarks else COLOR_RED
+        cv2.circle(frame, (w - 30, 50), 12, indicator, -1)
+        
+        cv2.imshow("NGT Combined Recognition", frame)
+        
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
+            break
+        elif key == ord('m'):
+            mirror_mode = not mirror_mode
+        elif key == ord('d'):
+            debug_mode = not debug_mode
+    
+    cap.release()
+    cv2.destroyAllWindows()
+    hands.close()
+    print("\nGoodbye!")
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+    '''NGT Combined Recognition System - Documentation
+Overview
+This system combines two recognition approaches to handle the full Dutch Sign Language (NGT) fingerspelling alphabet:
+ApproachLettersMethodWhen UsedStaticA-G, I, K-Y (23 letters)Random ForestHand is STILLDynamicH, J, Z (3 letters)Dynamic Time Warping (DTW)Hand is MOVING
+
+Why Two Approaches?
+Static Letters (A-G, I, K-Y)
+
+Hand shape doesn't change
+Single frame is enough to recognize
+Random Forest classifier works well
+
+Dynamic Letters (H, J, Z)
+
+Require MOVEMENT to form the letter
+H: V-sign bouncing up-down
+J: Pinky draws J curve
+Z: Index draws Z shape
+Need to analyze movement SEQUENCE over time
+DTW compares movement patterns
+
+
+System Architecture
+┌─────────────────────────────────────────────────────────────┐
+│                    COMBINED RECOGNIZER                       │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│   Hand Detected                                              │
+│        │                                                     │
+│        ▼                                                     │
+│   ┌─────────────┐                                           │
+│   │ Motion      │                                           │
+│   │ Detection   │                                           │
+│   └──────┬──────┘                                           │
+│          │                                                   │
+│    ┌─────┴─────┐                                            │
+│    │           │                                             │
+│    ▼           ▼                                             │
+│  STILL      MOVING                                           │
+│    │           │                                             │
+│    ▼           ▼                                             │
+│ ┌──────────┐ ┌──────────────┐                               │
+│ │ Random   │ │ Record       │                               │
+│ │ Forest   │ │ Movement     │                               │
+│ │ (Static) │ │ Frames       │                               │
+│ └────┬─────┘ └──────┬───────┘                               │
+│      │              │                                        │
+│      │              ▼                                        │
+│      │        ┌──────────┐                                  │
+│      │        │ DTW      │                                  │
+│      │        │ Compare  │                                  │
+│      │        │ (Dynamic)│                                  │
+│      │        └────┬─────┘                                  │
+│      │             │                                         │
+│      └──────┬──────┘                                        │
+│             │                                                │
+│             ▼                                                │
+│     ┌──────────────┐                                        │
+│     │   RESULT     │                                        │
+│     │  A-Z Letter  │                                        │
+│     └──────────────┘                                        │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+
+State Machine
+The recognizer operates as a state machine:
+         ┌──────────────────────────────────────────┐
+         │                                          │
+         ▼                                          │
+    ┌─────────┐                                     │
+    │  IDLE   │ ◄───────────────────────────────────┤
+    └────┬────┘                                     │
+         │                                          │
+    ┌────┴────────────────┐                         │
+    │                     │                         │
+    ▼                     ▼                         │
+Hand STILL           Hand MOVING                    │
+(15 frames)          (5 frames)                     │
+    │                     │                         │
+    ▼                     ▼                         │
+┌──────────────┐   ┌─────────────────┐              │
+│STATIC_PREDICT│   │RECORDING_DYNAMIC│              │
+└──────┬───────┘   └────────┬────────┘              │
+       │                    │                       │
+       │              Hand stops                    │
+       │              (15 frames still)             │
+       │                    │                       │
+       │                    ▼                       │
+       │           ┌─────────────────┐              │
+       │           │ DYNAMIC_PREDICT │              │
+       │           │ (DTW comparison)│              │
+       │           └────────┬────────┘              │
+       │                    │                       │
+       └────────────────────┴───────────────────────┘
+
+Configuration Parameters
+Movement Detection
+ParameterValueDescriptionMOVEMENT_THRESHOLD0.015Motion level to consider "moving"STILLNESS_THRESHOLD0.008Motion level to consider "still"STILLNESS_FRAMES15Frames of stillness before static predictionMOVEMENT_FRAMES5Frames of movement before recording dynamic
+Static Recognition (Random Forest)
+ParameterValueDescriptionSTATIC_CONFIDENCE_THRESHOLD0.60Minimum confidence (60%)STABILITY_THRESHOLD10Consecutive same predictions needed
+Dynamic Recognition (DTW)
+ParameterValueDescriptionMIN_DYNAMIC_FRAMES15Minimum frames for valid gestureMAX_DYNAMIC_FRAMES150Maximum frames (safety limit)DTW_THRESHOLD35.0DTW distance thresholdMIN_DTW_CONFIDENCE0.90Minimum confidence (90%)
+
+File Requirements
+For Static Letters (Random Forest)
+models/
+└── random_forest.joblib    ← Trained model (from teammate)
+Train using: train_model.ipynb
+For Dynamic Letters (DTW)
+data/
+└── dynamic/
+    ├── H/
+    │   ├── H_0001_20240124.npy
+    │   ├── H_0002_20240124.npy
+    │   └── ... (15-20 samples)
+    ├── J/
+    │   └── ... (15-20 samples)
+    └── Z/
+        └── ... (15-20 samples)
+        
+        Data Formats
+Static Data (CSV - Teammate's format)
+42 values per sample:
+[x0, y0, x1, y1, ..., x20, y20]
+
+- 21 landmarks × 2 coordinates (x, y)
+- Normalized to wrist position
+- Single frame per sample
+Dynamic Data (NPY - Our format)
+66 values per frame:
+[wrist_x, wrist_y, wrist_z,   ← Absolute wrist position
+ x0, y0, z0,                   ← Landmark 0 relative to wrist
+ x1, y1, z1,                   ← Landmark 1 relative to wrist
+ ...
+ x20, y20, z20]                ← Landmark 20 relative to wrist
+
+Multiple frames per sample (15-150 frames)
+Why absolute wrist for dynamic?
+
+Letter H requires detecting wrist BOUNCE (up-down movement)
+If all landmarks relative to wrist, bounce is invisible
+Absolute wrist position captures the bouncing motion
+
+
+Usage
+Running the Combined Recognizer
+bashpython recognize_combined.py
+Controls
+KeyActionQQuitMToggle mirror modeDToggle debug info
+How to Use
+
+For Static Letters (A-G, I, K-Y):
+
+Hold your hand STILL in the letter shape
+Wait ~0.5 seconds
+Result appears (cyan box, "STATIC" label)
+
+
+For Dynamic Letters (H, J, Z):
+
+Start the movement
+Complete the full gesture
+Stop and hold still
+Result appears (green box, "DYNAMIC" label)
+
+
+
+
+Display Elements
+State Indicator (Top)
+StateColorMeaning"Waiting for hand..."WhiteNo hand detected"Detecting STATIC letter..."CyanHand still, analyzing shape"Recording DYNAMIC gesture (N frames)"RedRecording movement
+Result Box (Right Side)
+LabelColorMeaningSTATICCyanLetter recognized from hand shapeDYNAMICGreenLetter recognized from movement
+Hand Indicator (Top Right)
+ColorMeaningGreen circleHand detectedRed circleNo hand'''

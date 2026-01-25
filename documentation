@@ -1,0 +1,459 @@
+# NGT Sign Language Recognition System
+## Complete Documentation
+
+---
+
+## Overview
+
+This system recognizes Dutch Sign Language (NGT) fingerspelling letters using computer vision. It uses a **two-stage approach** to be efficient:
+
+- **Stage 1:** Quick checks every frame - "Is the user trying to sign?"
+- **Stage 2:** Expensive recognition only when triggered - "Which letter is it?"
+
+---
+
+## Project Structure
+
+```
+NGT-Sign-Language-Recognition/
+│
+├── data/
+│   ├── static/                    # Static letter recordings
+│   │   └── landmarks.csv          # All static letters in one file
+│   │
+│   └── dynamic/                   # Dynamic letter recordings
+│       ├── H/
+│       │   ├── H_0001.npy         # Recording 1 (shape: frames × 63)
+│       │   ├── H_0002.npy         # Recording 2
+│       │   └── ...
+│       ├── J/
+│       │   └── ...
+│       └── Z/
+│           └── ...
+│
+├── models/
+│   └── static_model.pkl           # Trained classifier for static letters
+│
+├── record_dynamic_smart.py        # Record H, J, Z with motion detection
+├── visualize_movement.py          # See your hand path on screen
+├── recognize.py                   # Main recognition system
+└── README.md                      # This file
+```
+
+---
+
+## How It Works
+
+### The Two-Stage Detection System
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     EVERY FRAME (30 fps)                        │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│   STAGE 1: Quick Checks (Very Fast ~1ms)                       │
+│   ────────────────────────────────────                         │
+│                                                                 │
+│   ┌──────────────────────┐                                     │
+│   │ Hand in signing zone? │ → NO → Skip, keep watching         │
+│   └──────────┬───────────┘                                     │
+│              │ YES                                              │
+│              ▼                                                  │
+│   ┌──────────────────────┐                                     │
+│   │ Signing hand shape?   │ → NO → Skip, keep watching         │
+│   └──────────┬───────────┘                                     │
+│              │ YES                                              │
+│              ▼                                                  │
+│   ┌──────────────────────┐                                     │
+│   │ Motion started?       │ → NO → Skip, keep watching         │
+│   └──────────┬───────────┘                                     │
+│              │ YES                                              │
+│              ▼                                                  │
+│        START RECORDING                                          │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────┐
+│                     RECORDING PHASE                             │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│   Capture frames until:                                         │
+│   • Motion stops (user finished the sign)                      │
+│   • OR max frames reached (safety limit)                       │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────┐
+│              ONCE PER GESTURE (Not every frame!)                │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│   STAGE 2: Recognition (Slower ~50-100ms, but only once)       │
+│   ───────────────────────────────────────────────────          │
+│                                                                 │
+│   Compare recorded movement to templates using DTW:             │
+│                                                                 │
+│   User's movement ──┬── vs H templates → distance: 0.15        │
+│                     ├── vs J templates → distance: 2.45        │
+│                     └── vs Z templates → distance: 3.12        │
+│                                                                 │
+│   RESULT: Lowest distance wins → Letter H!                     │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Stage 1: Trigger Detection (Code Explanation)
+
+```python
+def process_frame(self, hand_landmarks, face_landmarks):
+    """Called every frame - must be fast!"""
+    
+    if self.state == "WATCHING":
+        
+        # CHECK 1: Is hand near face? (Signing zone)
+        # ─────────────────────────────────────────
+        # Signs are made near the face/shoulder area
+        # If hand is down by your side, you're not signing
+        
+        if not self.hand_in_signing_zone(hand_landmarks, face_landmarks):
+            return None  # Not signing, skip
+        
+        # CHECK 2: Is hand in a signing shape?
+        # ─────────────────────────────────────
+        # H = V shape (2 fingers)
+        # J = Pinky extended
+        # Z = Index extended
+        # If hand is in a fist or random position, probably not signing
+        
+        if not is_signing_handshape(hand_landmarks):
+            return None  # Not signing, skip
+        
+        # CHECK 3: Did significant motion start?
+        # ───────────────────────────────────────
+        # Dynamic letters involve movement
+        # Wait until hand starts moving before recording
+        
+        if motion > MOTION_START_THRESHOLD:
+            self.motion_counter += 1
+            if self.motion_counter >= 3:  # Confirm motion is real
+                self.state = "RECORDING"  # Start capturing!
+```
+
+**Why this is fast:** Each check is simple math (distance, position comparison). No machine learning, no DTW. Takes ~1ms per frame.
+
+---
+
+## Stage 2: DTW Recognition (Code Explanation)
+
+```python
+def recognize_dynamic(self, movement_frames):
+    """Called ONCE after recording stops"""
+    
+    movement = np.array(movement_frames)  # Shape: (frames, 63)
+    
+    best_letter = None
+    best_distance = float('inf')
+    
+    # Compare to ALL templates
+    for letter in ['H', 'J', 'Z']:
+        for template in self.templates[letter]:
+            
+            # FastDTW handles different speeds automatically
+            distance, _ = fastdtw(template, movement, dist=euclidean)
+            
+            # Normalize by length
+            normalized = distance / (len(template) + len(movement))
+            
+            if normalized < best_distance:
+                best_distance = normalized
+                best_letter = letter
+    
+    return best_letter, confidence
+```
+
+**Why this is slow:** DTW compares every frame to every template frame. But it only runs ONCE per gesture, not 30 times per second.
+
+---
+
+## Data Storage Format
+
+### Dynamic Letters (H, J, Z)
+
+Each recording is saved as a `.npy` file:
+
+```
+File: H_0001_20260123_150030.npy
+Shape: (45, 63)
+       ↑    ↑
+       │    └── 63 landmark values (21 points × 3 coordinates)
+       └─────── 45 frames of movement
+```
+
+**Landmark structure (63 values):**
+```
+Index 0-2:   Wrist (x, y, z) - always (0, 0, 0) since normalized
+Index 3-5:   Thumb CMC
+Index 6-8:   Thumb MCP
+...
+Index 60-62: Pinky tip
+```
+
+### Static Letters (A, B, C, etc.)
+
+Single CSV file with all samples:
+
+```csv
+letter,lm_0,lm_1,lm_2,...,lm_62
+A,0.12,0.34,0.05,...,0.23
+A,0.11,0.35,0.04,...,0.22
+B,0.45,0.12,0.33,...,0.67
+```
+
+---
+
+## How to Use
+
+### Step 1: Record Training Data
+
+```bash
+# Record dynamic letters (H, J, Z)
+python record_dynamic_smart.py
+
+# Or use the visualizer to check your movements
+python visualize_movement.py
+```
+
+**Record at least 10-15 samples per letter** for good recognition.
+
+### Step 2: Run Recognition
+
+```bash
+python recognize.py
+```
+
+### Controls
+
+| Key | Action |
+|-----|--------|
+| Q | Quit |
+| M | Toggle mirror mode |
+| D | Toggle debug view (shows motion meter, signing zone) |
+
+---
+
+## Configuration Parameters
+
+; In `recognize.py`, you can tune these values:
+
+; ```python
+; # Stage 1: When to trigger recording
+; SIGNING_ZONE_THRESHOLD = 0.3    # Hand must be within 30% of screen from face
+; MOTION_START_THRESHOLD = 0.02   # Motion magnitude to start recording
+; MOTION_STOP_THRESHOLD = 0.008   # Motion magnitude to stop recording
+; STILLNESS_FRAMES = 12           # Frames of stillness to confirm stop
+; MOTION_FRAMES = 3               # Frames of motion to confirm start
+
+; # Stage 2: Recognition
+; DTW_MATCH_THRESHOLD = 15.0      # Max DTW distance to accept as match
+; MIN_RECORDING_FRAMES = 15       # Minimum frames for valid recording
+; MAX_RECORDING_FRAMES = 120      # Maximum frames (safety limit)
+```
+
+---
+
+## Why Not Use ML for Dynamic Letters?
+
+**DTW (Template Matching) vs ML (Neural Network):**
+
+| Aspect | DTW | Neural Network |
+|--------|-----|----------------|
+| Training data needed | 10-15 samples | 100s-1000s of samples |
+| Training time | None! | Hours |
+| Accuracy with few samples | Good | Poor |
+| Handles speed variation | Yes, automatically | Needs augmentation |
+| Complexity | Simple | Complex |
+| Good for 3 letters? | ✅ Perfect | ❌ Overkill |
+
+**For only 3 dynamic letters (H, J, Z), DTW is the better choice.**
+
+---
+
+## Troubleshooting
+
+### "Not recognizing my signs"
+
+1. **Check templates exist:** Look in `data/dynamic/H/`, `J/`, `Z/`
+2. **Record more samples:** Need at least 10 per letter
+3. **Check motion threshold:** Enable debug mode (D key) to see motion meter
+4. **Stay in signing zone:** Keep hand near face level
+
+### "False triggers"
+
+1. **Increase MOTION_START_THRESHOLD:** Makes it less sensitive
+2. **Increase MOTION_FRAMES:** Requires more consistent motion to trigger
+
+### "Recording stops too early"
+
+1. **Decrease MOTION_STOP_THRESHOLD:** Requires less stillness to stop
+2. **Increase STILLNESS_FRAMES:** Requires longer pause to stop
+
+---
+
+## File Summary
+
+| File | Purpose |
+|------|---------|
+| `record_dynamic_smart.py` | Record H, J, Z with auto motion detection |
+| `visualize_movement.py` | See hand path on screen (for verification) |
+| `recognize.py` | Main recognition system with two-stage detection |
+
+---
+
+## Dependencies
+
+```bash
+pip install opencv-python mediapipe numpy scipy fastdtw
+```
+
+---
+
+## Quick Start
+
+```bash
+# 1. Record some samples
+python record_dynamic_smart.py
+# Press H, then SPACE, do the movement, repeat 10-15 times
+# Same for J and Z
+
+# 2. Run recognition
+python recognize.py
+# Make signs and see them recognized!
+```
+
+
+
+
+What SHOULD Vary Between Samples?
+Vary ThisWhySpeedSometimes fast, sometimes slowSize of movementSometimes big, sometimes smallerSlight angleNatural variation in how you hold handDistance from cameraCloser / further (within reason)
+4. What Should Stay the SAME?
+Keep SameWhyWhich handLeft vs right = different landmarksGeneral signing areaNear face, not random placesThe actual gestureObviously!
+
+
+
+Recording Notes - Confidence Settings
+Summary
+During data collection, MediaPipe hand detection confidence was adjusted to handle different hand shapes.
+Settings Used
+LetterDetection ConfidenceTracking ConfidenceReasonH0.5 - 0.70.5 - 0.7V-sign is easily detectedJ0.30.3Pinky-only shape is harder to detectZ0.30.3Index pointing works at low confidence
+Why This Is OK
+
+Confidence doesn't affect saved data - Once a hand IS detected, the 63 landmark values (21 points × 3 coordinates) are the same regardless of confidence setting.
+Confidence only affects detection - It determines "is there a hand?" not "where are the fingers?"
+Different hand shapes need different settings:
+
+Open hand / V-sign → Easy to detect (high confidence works)
+Single finger extended → Harder to detect (needs low confidence)
+
+
+
+What The Settings Mean
+min_detection_confidence = 0.3
+→ "I only need to be 30% sure there's a hand to start tracking"
+
+min_tracking_confidence = 0.3  
+→ "I only need to be 30% sure to keep tracking the hand"
+Final Settings (Used for All Recognition)
+pythonhands = mp_hands.Hands(
+    static_image_mode=False,
+    max_num_hands=1,
+    min_detection_confidence=0.3,
+    min_tracking_confidence=0.3
+)
+Low confidence (0.3) used for final system to ensure all hand shapes are detected during recognition.
+Data Integrity
+✓ All recorded samples contain valid landmark data
+✓ Mixing samples from different confidence settings is fine
+✓ No re-recording needed
+
+
+
+
+
+
+
+
+
+
+# Recording Notes - Confidence Settings
+
+## Summary
+
+During data collection, MediaPipe hand detection settings were adjusted to handle different hand shapes and improve tracking accuracy.
+
+## Final MediaPipe Settings
+
+```python
+hands = mp_hands.Hands(
+    static_image_mode=False,
+    max_num_hands=1,
+    model_complexity=1,            # Full model for better accuracy
+    min_detection_confidence=0.3,
+    min_tracking_confidence=0.3
+)
+```
+
+## Settings Explained
+
+### model_complexity
+
+| Value | Name | Speed | Accuracy | Use Case |
+|-------|------|-------|----------|----------|
+| 0 | Lite | ~30+ FPS | Basic | Simple hand shapes |
+| **1** | **Full** | **~20-25 FPS** | **Better** | **Closed hands, unusual poses** |
+
+**Why we use 1:** The J sign requires a closed fist with pinky extended. The Lite model (0) struggles with closed hands and causes jumpy/wrong landmarks. The Full model (1) handles this much better while still running in real-time.
+
+### min_detection_confidence (0.3)
+
+```
+"How sure must MediaPipe be to say there's a hand?"
+
+0.7 = Very sure (misses unusual hand shapes)
+0.3 = Somewhat sure (detects more hand shapes) ✓
+```
+
+**Why 0.3:** The J hand shape (fist + pinky) is unusual. Higher confidence fails to detect it.
+
+### min_tracking_confidence (0.3)
+
+```
+"How sure must MediaPipe be to keep tracking?"
+
+0.7 = Very sure (loses hand during movement)
+0.3 = Somewhat sure (maintains tracking) ✓
+```
+
+**Why 0.3:** Hand moves during signs. Lower confidence prevents losing track mid-sign.
+
+## Letter-Specific Challenges
+
+| Letter | Hand Shape | Detection Difficulty |
+|--------|------------|---------------------|
+| H | V-sign (2 fingers) | Easy ✓ |
+| J | Fist + pinky | Hard - needs low confidence + full model |
+| Z | Pointing index | Medium |
+
+## Recording Tips for Difficult Shapes (J)
+
+1. **Don't make a tight fist** - keep hand relaxed
+2. **Pinky clearly separated** - not tucked against hand
+3. **Palm facing camera** - easier to detect
+4. **Move at medium speed** - not too fast
+
+## Data Integrity Note
+
+✓ Confidence settings affect DETECTION, not saved data
+✓ Once hand is detected, landmark values are the same
+✓ Samples recorded with different settings can be mixed
+✓ model_complexity=1 gives more accurate landmarks for closed hands
