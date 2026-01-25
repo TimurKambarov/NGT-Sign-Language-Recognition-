@@ -1,0 +1,595 @@
+"""
+NGT Dynamic Letter Recorder - V5 (FULL HAND TRACKING)
+=====================================================
+Records ALL 21 hand landmarks for precise gesture recognition.
+
+Controls:
+    H, J, Z  = Select letter
+    SPACE    = Start/Stop recording
+    P        = Preview last recording (shows ALL fingers)
+    G        = Show how to do the sign
+    R        = Reset / Delete last recording
+    Q        = Quit
+"""
+
+import cv2
+import mediapipe as mp
+import numpy as np
+import os
+from datetime import datetime
+
+# ============== CONFIGURATION ==============
+
+DATA_DIR = "data/dynamic"
+MIN_FRAMES = 15
+MAX_FRAMES = 150
+
+DYNAMIC_LETTERS = {
+    'H': "V-sign (peace sign) bouncing UP and DOWN",
+    'J': "Fist with pinky out - draw J shape in air", 
+    'Z': "Point with index - draw Z shape in air"
+}
+
+# ============== MEDIAPIPE SETUP ==============
+
+mp_hands = mp.solutions.hands
+mp_drawing = mp.solutions.drawing_utils
+
+hands = mp_hands.Hands(
+    static_image_mode=False,
+    max_num_hands=1,
+    model_complexity=1,            # Full model for better accuracy
+    min_detection_confidence=0.4,
+    min_tracking_confidence=0.4
+)
+
+# Finger colors (BGR)
+FINGER_COLORS = {
+    'Thumb': (0, 165, 255),   # Orange
+    'Index': (0, 255, 0),     # Green
+    'Middle': (255, 100, 0),  # Blue
+    'Ring': (0, 255, 255),    # Yellow
+    'Pinky': (255, 0, 255),   # Magenta
+}
+
+FINGERTIP_INDICES = {
+    'Thumb': 4,
+    'Index': 8,
+    'Middle': 12,
+    'Ring': 16,
+    'Pinky': 20,
+}
+
+# Create folders
+for letter in DYNAMIC_LETTERS.keys():
+    os.makedirs(os.path.join(DATA_DIR, letter), exist_ok=True)
+
+
+# ============== HELPER FUNCTIONS ==============
+
+def get_sample_count(letter):
+    """Count existing samples for a letter"""
+    letter_dir = os.path.join(DATA_DIR, letter)
+    if os.path.exists(letter_dir):
+        return len([f for f in os.listdir(letter_dir) if f.endswith('.npy')])
+    return 0
+
+
+def extract_landmarks(hand_landmarks):
+    """
+    Extract ALL 63 landmark values (21 points × 3 coords) normalized to wrist,
+    PLUS absolute wrist position (3 more values) = 66 total values.
+    
+    This captures:
+    - Hand SHAPE (fingers relative to wrist)
+    - Hand POSITION (absolute wrist location for H bounce detection)
+    """
+    landmarks = []
+    wrist = hand_landmarks.landmark[0]
+    
+    # First: Add ABSOLUTE wrist position (important for H!)
+    landmarks.extend([wrist.x, wrist.y, wrist.z])
+    
+    # Then: Add all landmarks relative to wrist (hand shape)
+    for lm in hand_landmarks.landmark:
+        landmarks.extend([
+            lm.x - wrist.x,
+            lm.y - wrist.y,
+            lm.z - wrist.z
+        ])
+    
+    return np.array(landmarks, dtype=np.float32)  # 66 values total
+
+
+def save_recording(letter, frames):
+    """Save recording to .npy file"""
+    letter_dir = os.path.join(DATA_DIR, letter)
+    count = get_sample_count(letter)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"{letter}_{count:04d}_{timestamp}.npy"
+    filepath = os.path.join(letter_dir, filename)
+    np.save(filepath, np.array(frames))
+    return filepath, count + 1
+
+
+def delete_last_recording(letter):
+    """Delete the most recent recording for a letter"""
+    letter_dir = os.path.join(DATA_DIR, letter)
+    if not os.path.exists(letter_dir):
+        return None
+    
+    files = sorted([f for f in os.listdir(letter_dir) if f.endswith('.npy')])
+    if files:
+        last_file = files[-1]
+        filepath = os.path.join(letter_dir, last_file)
+        os.remove(filepath)
+        return last_file
+    return None
+
+
+def calculate_movement(frames):
+    """Calculate total movement for feedback, including WRIST movement"""
+    if len(frames) < 2:
+        return 0, {}
+    
+    frames_arr = np.array(frames)
+    
+    # Check if new format (66 values) or old format (63 values)
+    has_absolute_wrist = frames_arr.shape[1] == 66
+    offset = 3 if has_absolute_wrist else 0
+    
+    movements = {}
+    
+    # Calculate wrist movement (absolute position) - important for H!
+    if has_absolute_wrist:
+        wrist_x = frames_arr[:, 0]
+        wrist_y = frames_arr[:, 1]
+        wrist_x_range = np.max(wrist_x) - np.min(wrist_x)
+        wrist_y_range = np.max(wrist_y) - np.min(wrist_y)
+        movements['Wrist'] = wrist_x_range + wrist_y_range
+    
+    # Calculate movement for each fingertip (relative to wrist)
+    for name, idx in FINGERTIP_INDICES.items():
+        x_vals = frames_arr[:, offset + idx * 3]
+        y_vals = frames_arr[:, offset + idx * 3 + 1]
+        
+        x_range = np.max(x_vals) - np.min(x_vals)
+        y_range = np.max(y_vals) - np.min(y_vals)
+        movements[name] = x_range + y_range
+    
+    total = sum(movements.values())
+    return total, movements
+
+
+# ============== PREVIEW FUNCTION ==============
+
+def show_preview(frames, letter):
+    """
+    Show animated preview of ALL finger movements + wrist.
+    This helps you see if you recorded the gesture correctly.
+    """
+    if len(frames) < 5:
+        print("   Not enough frames to preview")
+        return
+    
+    preview_size = 550
+    frames_arr = np.array(frames)
+    
+    # Check if new format (66 values) or old format (63 values)
+    has_absolute_wrist = frames_arr.shape[1] == 66
+    offset = 3 if has_absolute_wrist else 0
+    
+    # Extract ALL fingertip trajectories
+    paths = {}
+    for name, idx in FINGERTIP_INDICES.items():
+        x_vals = frames_arr[:, offset + idx * 3]
+        y_vals = frames_arr[:, offset + idx * 3 + 1]
+        paths[name] = list(zip(x_vals, y_vals))
+    
+    # Also extract ABSOLUTE wrist position if available (important for H!)
+    if has_absolute_wrist:
+        wrist_x = frames_arr[:, 0]
+        wrist_y = frames_arr[:, 1]
+        paths['Wrist'] = list(zip(wrist_x, wrist_y))
+    
+    # Find bounds for normalization
+    all_x = [p[0] for path in paths.values() for p in path]
+    all_y = [p[1] for path in paths.values() for p in path]
+    
+    x_min, x_max = min(all_x), max(all_x)
+    y_min, y_max = min(all_y), max(all_y)
+    
+    margin = 80
+    x_range = max(x_max - x_min, 0.01)
+    y_range = max(y_max - y_min, 0.01)
+    scale = min((preview_size - 2*margin) / x_range, (preview_size - 2*margin) / y_range)
+    
+    # Convert to screen coordinates
+    screen_paths = {}
+    for name, path in paths.items():
+        screen_path = []
+        for x, y in path:
+            sx = int(margin + (x - x_min) * scale)
+            sy = int(margin + (y - y_min) * scale)
+            sx = preview_size - sx  # Mirror for natural view
+            screen_path.append((sx, sy))
+        screen_paths[name] = screen_path
+    
+    # Add wrist color
+    all_colors = dict(FINGER_COLORS)
+    all_colors['Wrist'] = (255, 255, 255)  # White for wrist
+    
+    # Animate
+    for i in range(len(frames)):
+        frame = np.zeros((preview_size, preview_size, 3), dtype=np.uint8)
+        frame[:] = (40, 40, 40)
+        
+        # Title
+        cv2.putText(frame, f"Preview: Letter {letter}", (20, 35),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        
+        info_text = "ALL fingers + WRIST tracked" if has_absolute_wrist else "ALL fingers tracked"
+        cv2.putText(frame, info_text, (20, 60),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
+        
+        # Draw each path's trail
+        for name, screen_path in screen_paths.items():
+            color = all_colors.get(name, (200, 200, 200))
+            
+            # Draw trail up to current frame
+            for j in range(1, min(i + 1, len(screen_path))):
+                alpha = j / (i + 1)
+                trail_color = tuple(int(c * (0.3 + 0.7 * alpha)) for c in color)
+                thickness = 3 if name == 'Wrist' else 2
+                cv2.line(frame, screen_path[j-1], screen_path[j], trail_color, thickness)
+            
+            # Draw current position
+            if i < len(screen_path):
+                radius = 10 if name == 'Wrist' else 8
+                cv2.circle(frame, screen_path[i], radius, color, -1)
+                cv2.circle(frame, screen_path[i], radius + 2, (255, 255, 255), 1)
+        
+        # Legend
+        y_legend = 90
+        for name in list(FINGER_COLORS.keys()) + (['Wrist'] if has_absolute_wrist else []):
+            color = all_colors.get(name, (200, 200, 200))
+            cv2.circle(frame, (30, y_legend), 6, color, -1)
+            label = f"{name} (BOUNCE!)" if name == 'Wrist' and letter == 'H' else name
+            cv2.putText(frame, label, (45, y_legend + 4),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
+            y_legend += 20
+        
+        # Frame counter
+        cv2.putText(frame, f"Frame {i+1}/{len(frames)}", (20, preview_size - 40),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+        
+        # Instructions
+        cv2.putText(frame, "Press any key to stop preview", (20, preview_size - 15),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.45, (150, 150, 150), 1)
+        
+        cv2.imshow("Preview - All Fingers", frame)
+        
+        # Wait, but allow early exit
+        if cv2.waitKey(50) != -1:
+            break
+    
+    # Show final frame for a moment
+    cv2.waitKey(500)
+    cv2.destroyWindow("Preview - All Fingers")
+
+
+def show_guide(letter):
+    """Show how to do the sign"""
+    guide_size = 400
+    frame = np.zeros((guide_size, guide_size, 3), dtype=np.uint8)
+    frame[:] = (50, 50, 50)
+    
+    cv2.putText(frame, f"How to sign: {letter}", (20, 40),
+               cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+    
+    if letter == 'H':
+        # H guide
+        cv2.putText(frame, "1. Make V-sign (peace sign)", (30, 100),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+        cv2.putText(frame, "2. Bounce hand UP and DOWN", (30, 140),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+        cv2.putText(frame, "3. Keep other fingers closed", (30, 180),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+        
+        # Draw arrows
+        cv2.arrowedLine(frame, (200, 250), (200, 200), (0, 255, 0), 3)
+        cv2.arrowedLine(frame, (200, 280), (200, 330), (0, 255, 0), 3)
+        cv2.putText(frame, "UP", (220, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+        cv2.putText(frame, "DOWN", (220, 330), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+    
+    elif letter == 'J':
+        # J guide
+        cv2.putText(frame, "1. Make fist with PINKY out", (30, 100),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+        cv2.putText(frame, "2. Move DOWN", (30, 140),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+        cv2.putText(frame, "3. Then CURVE left/inward", (30, 180),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+        
+        # Draw J shape
+        pts = [(200, 220), (200, 300), (180, 340), (140, 340)]
+        for i in range(len(pts)-1):
+            cv2.line(frame, pts[i], pts[i+1], (255, 0, 255), 3)
+        cv2.circle(frame, pts[0], 8, (255, 0, 255), -1)
+        cv2.putText(frame, "START", (210, 220), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
+    
+    elif letter == 'Z':
+        # Z guide
+        cv2.putText(frame, "1. Point with INDEX finger", (30, 100),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+        cv2.putText(frame, "2. Draw Z: right, diagonal, right", (30, 140),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+        cv2.putText(frame, "3. Keep other fingers closed", (30, 180),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+        
+        # Draw Z shape
+        pts = [(120, 230), (280, 230), (120, 340), (280, 340)]
+        cv2.line(frame, pts[0], pts[1], (0, 255, 0), 3)
+        cv2.line(frame, pts[1], pts[2], (0, 255, 0), 3)
+        cv2.line(frame, pts[2], pts[3], (0, 255, 0), 3)
+        cv2.circle(frame, pts[0], 8, (0, 255, 0), -1)
+        cv2.putText(frame, "1", (100, 225), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+        cv2.putText(frame, "2", (285, 225), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+        cv2.putText(frame, "3", (100, 350), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+    
+    cv2.putText(frame, "Press any key to close", (100, guide_size - 20),
+               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
+    
+    cv2.imshow("Guide", frame)
+    cv2.waitKey(0)
+    cv2.destroyWindow("Guide")
+
+
+# ============== MAIN ==============
+
+def main():
+    print("\n" + "="*60)
+    print("   NGT DYNAMIC LETTER RECORDER - V5")
+    print("="*60)
+    print("\n   Records ALL 21 hand landmarks for precise recognition!")
+    print("\n   Controls:")
+    print("   H, J, Z = Select letter")
+    print("   SPACE   = Start/Stop recording")
+    print("   P       = Preview last recording")
+    print("   G       = Show guide for current letter")
+    print("   R       = Delete last recording")
+    print("   Q       = Quit")
+    print("\n   Tips:")
+    print("   - Do the COMPLETE gesture from start to finish")
+    print("   - Keep hand shape consistent")
+    print("   - Record 15-20 samples per letter")
+    print("="*60 + "\n")
+    
+    # Show current sample counts
+    print("📂 Current samples:")
+    for letter in DYNAMIC_LETTERS.keys():
+        count = get_sample_count(letter)
+        print(f"   {letter}: {count} samples")
+    print()
+    
+    # Camera
+    cap = cv2.VideoCapture(0)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    
+    # State
+    current_letter = None
+    recording = False
+    frames = []
+    last_frames = []
+    feedback_message = ""
+    feedback_timer = 0
+    
+    print("Select a letter (H, J, Z) to begin...\n")
+    
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        
+        frame = cv2.flip(frame, 1)  # Mirror
+        h, w = frame.shape[:2]
+        
+        # Process hand
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = hands.process(rgb)
+        
+        hand_detected = False
+        
+        if results.multi_hand_landmarks:
+            hand_detected = True
+            hand_lm = results.multi_hand_landmarks[0]
+            
+            # Draw hand skeleton
+            mp_drawing.draw_landmarks(frame, hand_lm, mp_hands.HAND_CONNECTIONS,
+                mp_drawing.DrawingSpec(color=(0, 180, 0), thickness=2, circle_radius=2),
+                mp_drawing.DrawingSpec(color=(0, 150, 0), thickness=2))
+            
+            # Draw colored fingertips
+            for name, idx in FINGERTIP_INDICES.items():
+                tip = hand_lm.landmark[idx]
+                tip_x = int(tip.x * w)
+                tip_y = int(tip.y * h)
+                color = FINGER_COLORS[name]
+                cv2.circle(frame, (tip_x, tip_y), 10, color, -1)
+                cv2.circle(frame, (tip_x, tip_y), 12, (255, 255, 255), 2)
+            
+            # Draw wrist
+            wrist = hand_lm.landmark[0]
+            wrist_x = int(wrist.x * w)
+            wrist_y = int(wrist.y * h)
+            cv2.circle(frame, (wrist_x, wrist_y), 8, (255, 255, 255), -1)
+            
+            # Record if active
+            if recording:
+                landmarks = extract_landmarks(hand_lm)
+                frames.append(landmarks)
+        
+        # ============== DRAW UI ==============
+        
+        # Top panel
+        cv2.rectangle(frame, (0, 0), (w, 110), (0, 0, 0), -1)
+        
+        # Current letter
+        if current_letter:
+            cv2.putText(frame, f"Letter: {current_letter}", (20, 45),
+                       cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 2)
+            cv2.putText(frame, DYNAMIC_LETTERS[current_letter], (20, 80),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+            
+            # Sample count
+            count = get_sample_count(current_letter)
+            cv2.putText(frame, f"Samples: {count}", (20, 105),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 255, 150), 1)
+        else:
+            cv2.putText(frame, "Press H, J, or Z to select letter", (20, 50),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+        
+        # Recording indicator
+        if recording:
+            flash = int(cv2.getTickCount() / cv2.getTickFrequency() * 3) % 2
+            color = (0, 0, 255) if flash else (0, 0, 180)
+            cv2.circle(frame, (w - 80, 50), 20, color, -1)
+            cv2.putText(frame, f"REC {len(frames)}", (w - 160, 58),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        
+        # Hand indicator
+        indicator_color = (0, 255, 0) if hand_detected else (0, 0, 255)
+        indicator_text = "Hand OK" if hand_detected else "No Hand"
+        cv2.circle(frame, (w - 30, 100), 10, indicator_color, -1)
+        cv2.putText(frame, indicator_text, (w - 110, 105),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, indicator_color, 1)
+        
+        # Feedback message
+        if feedback_timer > 0:
+            feedback_timer -= 1
+            
+            # Draw feedback box
+            box_color = (0, 100, 0)
+            cv2.rectangle(frame, (w//2 - 200, h//2 - 60), (w//2 + 200, h//2 + 60), box_color, -1)
+            cv2.rectangle(frame, (w//2 - 200, h//2 - 60), (w//2 + 200, h//2 + 60), (0, 255, 0), 3)
+            
+            cv2.putText(frame, "SAVED!", (w//2 - 60, h//2 - 10),
+                       cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 2)
+            cv2.putText(frame, feedback_message, (w//2 - 150, h//2 + 30),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+            cv2.putText(frame, "Press P to preview", (w//2 - 80, h//2 + 50),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.45, (150, 255, 150), 1)
+        
+        # Bottom controls
+        cv2.rectangle(frame, (0, h - 40), (w, h), (30, 30, 30), -1)
+        controls = "H/J/Z=Select | SPACE=Record | P=Preview | G=Guide | R=Delete last | Q=Quit"
+        cv2.putText(frame, controls, (20, h - 15),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
+        
+        cv2.imshow("NGT Recorder V5", frame)
+        
+        # ============== INPUT ==============
+        
+        key = cv2.waitKey(1) & 0xFF
+        
+        if key == ord('q'):
+            break
+        
+        elif key in [ord('h'), ord('H')]:
+            current_letter = 'H'
+            recording = False
+            frames = []
+            print(f"\n📝 Selected: H - {DYNAMIC_LETTERS['H']}")
+            print(f"   Current samples: {get_sample_count('H')}")
+        
+        elif key in [ord('j'), ord('J')]:
+            current_letter = 'J'
+            recording = False
+            frames = []
+            print(f"\n📝 Selected: J - {DYNAMIC_LETTERS['J']}")
+            print(f"   Current samples: {get_sample_count('J')}")
+        
+        elif key in [ord('z'), ord('Z')]:
+            current_letter = 'Z'
+            recording = False
+            frames = []
+            print(f"\n📝 Selected: Z - {DYNAMIC_LETTERS['Z']}")
+            print(f"   Current samples: {get_sample_count('Z')}")
+        
+        elif key == ord(' '):
+            if current_letter:
+                if not recording:
+                    # Start recording
+                    recording = True
+                    frames = []
+                    print(f"\n   🔴 Recording {current_letter}... (press SPACE when done)")
+                else:
+                    # Stop recording
+                    recording = False
+                    print(f"   ⏹️  Stopped ({len(frames)} frames)")
+                    
+                    if len(frames) >= MIN_FRAMES:
+                        # Calculate movement info
+                        total_movement, finger_movements = calculate_movement(frames)
+                        
+                        # Save
+                        filepath, count = save_recording(current_letter, frames)
+                        print(f"   ✅ Saved: {filepath}")
+                        print(f"   📊 Total movement: {total_movement:.3f}")
+                        print(f"   📁 Total {current_letter} samples: {count}")
+                        
+                        feedback_message = f"{len(frames)} frames | Movement: {total_movement:.2f}"
+                        last_frames = frames.copy()
+                        feedback_timer = 60
+                    else:
+                        print(f"   ❌ Too short! Need at least {MIN_FRAMES} frames")
+                    
+                    frames = []
+            else:
+                print("   ⚠️  Select a letter first (H, J, or Z)")
+        
+        elif key in [ord('p'), ord('P')]:
+            if last_frames and current_letter:
+                print(f"\n   👁️  Showing preview of last {current_letter} recording...")
+                show_preview(last_frames, current_letter)
+            else:
+                print("   ⚠️  No recording to preview")
+        
+        elif key in [ord('g'), ord('G')]:
+            if current_letter:
+                print(f"\n   📖 Showing guide for {current_letter}...")
+                show_guide(current_letter)
+            else:
+                print("   ⚠️  Select a letter first")
+        
+        elif key in [ord('r'), ord('R')]:
+            if current_letter:
+                deleted = delete_last_recording(current_letter)
+                if deleted:
+                    print(f"\n   🗑️  Deleted: {deleted}")
+                    print(f"   📁 Remaining {current_letter} samples: {get_sample_count(current_letter)}")
+                else:
+                    print(f"   ⚠️  No recordings to delete for {current_letter}")
+            else:
+                print("   ⚠️  Select a letter first")
+    
+    cap.release()
+    cv2.destroyAllWindows()
+    hands.close()
+    
+    # Final summary
+    print("\n" + "="*60)
+    print("   RECORDING SESSION COMPLETE")
+    print("="*60)
+    print("\n   Final sample counts:")
+    for letter in DYNAMIC_LETTERS.keys():
+        count = get_sample_count(letter)
+        status = "✅" if count >= 15 else "⚠️ Need more!"
+        print(f"   {letter}: {count} samples {status}")
+    print("\n   Run 'python recognize.py' to test recognition!")
+    print("="*60 + "\n")
+
+
+if __name__ == "__main__":
+    main()
