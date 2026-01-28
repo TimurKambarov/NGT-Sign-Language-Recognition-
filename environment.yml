@@ -1,34 +1,21 @@
-# =============================================================================
-# NGT Sign Language Recognition - PyTorch Version
-# =============================================================================
-# WARNING: Conda can cause version conflicts with PyTorch + MediaPipe
-# RECOMMENDED: Use pip with virtual environment instead (see requirements.txt)
-#
-# Only use this if you must use conda
-# Install with: conda env create -f environment.yml
-# Activate with: conda activate ngt-pytorch
-# =============================================================================
-
-name: ngt-pytorch
+name: ngt-lgbm
 
 channels:
-  - pytorch
   - conda-forge
   - defaults
 
 dependencies:
   # Python version
   - python=3.10
-
-  # PyTorch (CPU-only to avoid CUDA conflicts)
-  - pytorch=2.1.0
-  - torchvision=0.16.0
-  - cpuonly
   
   # Machine Learning
+  - lightgbm=4.1.0
   - numpy=1.24.3
   - pandas=2.1.4
   - scikit-learn=1.3.2
+  
+  # Hyperparameter Optimization
+  - optuna=3.4.0
   
   # Visualization
   - matplotlib=3.8.2
@@ -37,15 +24,13 @@ dependencies:
   # Utilities
   - joblib=1.3.2
   
-  # Jupyter Notebook support
+  # Jupyter
   - jupyter=1.0.0
   - ipykernel=6.27.1
   - ipywidgets=8.1.1
 
-  # Install via pip (avoids conflicts)
+  # Install via pip (MediaPipe and OpenCV)
   - pip=23.3.1
   - pip:
       - opencv-python==4.8.1.78
       - mediapipe==0.10.9
-
-
