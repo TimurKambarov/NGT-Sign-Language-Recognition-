@@ -37,9 +37,9 @@ from datetime import datetime
 
 # ============== CONFIGURATION ==============
 
-# Output
-DATA_DIR = "data"
-OUTPUT_FILE = os.path.join(DATA_DIR, "sequences.csv")
+# Output - ABSOLUTE PATH to NGT folder
+DATA_DIR = r"C:\Users\Asus\Desktop\Sign language\NGT-Sign-Language-Recognition-\data"
+OUTPUT_FILE = os.path.join(DATA_DIR, "samples_merged.csv")
 
 # All 26 letters
 STATIC_LETTERS = list("ABCDEFGIKLMNOPQRSTUVWXY")  # 23 letters
@@ -50,9 +50,9 @@ ALL_LETTERS = list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")  # 26 letters
 FRAMES_STATIC = 45    # ~1.5 seconds at 30fps
 FRAMES_DYNAMIC = 75   # ~2.5 seconds at 30fps
 
-# Target samples per letter
-TARGET_STATIC = 50    # Minimum samples for static letters
-TARGET_DYNAMIC = 100  # Minimum samples for dynamic letters
+# Target samples per letter (all 100)
+TARGET_STATIC = 100   # Samples for static letters
+TARGET_DYNAMIC = 100  # Samples for dynamic letters
 
 # Colors (BGR)
 COLOR_GREEN = (0, 255, 0)
@@ -86,11 +86,11 @@ mp_hands = mp.solutions.hands
 mp_drawing = mp.solutions.drawing_utils
 
 hands = mp_hands.Hands(
-    static_image_mode=False,
+    static_image_mode=False,       # MUST be False for video/motion tracking
     max_num_hands=1,
-    model_complexity=1,
-    min_detection_confidence=0.5,
-    min_tracking_confidence=0.5
+    model_complexity=1,            # Full model for better accuracy
+    min_detection_confidence=0.35, # Balanced - tracks motion but won't detect face as hand
+    min_tracking_confidence=0.35   # Balanced - tracks motion but won't detect face as hand
 )
 
 # ============== HELPER FUNCTIONS ==============
@@ -116,19 +116,22 @@ def is_dynamic(letter):
 
 def create_column_names():
     """
-    Create column names:
-    sample_id, frame_id, wrist_x, wrist_y, wrist_z, x0, y0, z0, ..., x20, y20, z20, label
+    Create column names - Timur's format + absolute wrist at end:
+    sample_id, frame_id, x0, y0, z0, ..., x20, y20, z20, wrist_abs_x, wrist_abs_y, wrist_abs_z, label
     
-    Total landmark columns: 3 (absolute wrist) + 63 (relative) = 66
+    Total: 2 + 63 + 3 + 1 = 69 columns
+    
+    - x0,y0,z0 through x20,y20,z20 = landmarks relative to wrist (Timur's format)
+    - wrist_abs_x/y/z = absolute wrist position (for H bounce detection)
     """
     columns = ['sample_id', 'frame_id']
     
-    # Absolute wrist position (for H bounce detection)
-    columns.extend(['wrist_x', 'wrist_y', 'wrist_z'])
-    
-    # All 21 landmarks relative to wrist
+    # All 21 landmarks (x, y, z) - relative to wrist (Timur's format)
     for i in range(21):
         columns.extend([f'x{i}', f'y{i}', f'z{i}'])
+    
+    # Absolute wrist position (NEW - for H bounce detection)
+    columns.extend(['wrist_abs_x', 'wrist_abs_y', 'wrist_abs_z'])
     
     columns.append('label')
     return columns
@@ -137,22 +140,17 @@ def create_column_names():
 def extract_landmarks(hand_landmarks):
     """
     Extract 66 landmark values:
-    - 3 values: ABSOLUTE wrist position (x, y, z) - for H bounce detection!
-    - 63 values: All 21 landmarks RELATIVE to wrist (hand shape)
+    - 63 values: All 21 landmarks RELATIVE to wrist (Timur's format)
+    - 3 values: ABSOLUTE wrist position (for H bounce detection)
     
-    This captures BOTH:
-    - Hand SHAPE (fingers relative to wrist)
-    - Hand MOVEMENT (absolute wrist position for H bounce)
+    Note: Wrist (landmark 0) relative = (0, 0, 0) since it's relative to itself.
     
     Returns list of 66 floats.
     """
     wrist = hand_landmarks.landmark[0]
     landmarks = []
     
-    # FIRST: Absolute wrist position (important for H!)
-    landmarks.extend([wrist.x, wrist.y, wrist.z])
-    
-    # THEN: All landmarks relative to wrist (hand shape)
+    # FIRST: All 21 landmarks relative to wrist (Timur's format)
     for lm in hand_landmarks.landmark:
         landmarks.extend([
             lm.x - wrist.x,
@@ -160,22 +158,52 @@ def extract_landmarks(hand_landmarks):
             lm.z - wrist.z
         ])
     
-    return landmarks  # 66 values total
+    # THEN: Absolute wrist position (for H bounce detection)
+    landmarks.extend([wrist.x, wrist.y, wrist.z])
+    
+    return landmarks  # 66 values total (63 relative + 3 absolute wrist)
 
 
 def load_existing_data():
-    """Load existing CSV data or create empty DataFrame"""
-    expected_columns = create_column_names()
+    """Load existing CSV data or create empty DataFrame.
+    
+    If loading Timur's old format (66 columns), automatically adds
+    the 3 new wrist columns (wrist_abs_x, wrist_abs_y, wrist_abs_z) with value 0.
+    """
+    expected_columns = create_column_names()  # 69 columns
     
     if os.path.exists(OUTPUT_FILE):
         df = pd.read_csv(OUTPUT_FILE)
         print(f"✓ Loaded {len(df)} rows from {OUTPUT_FILE}")
         
-        # Check if columns match (in case format changed)
+        # Check if it's Timur's old format (66 columns without wrist_abs)
+        if len(df.columns) == 66 and 'wrist_abs_x' not in df.columns:
+            print(f"   📦 Detected Timur's format (66 columns)")
+            print(f"   🔄 Adding wrist_abs_x, wrist_abs_y, wrist_abs_z columns...")
+            
+            # Insert the 3 wrist columns before 'label' (which is the last column)
+            # Value = 0 for old data (we don't have absolute positions for old recordings)
+            df['wrist_abs_x'] = 0.0
+            df['wrist_abs_y'] = 0.0
+            df['wrist_abs_z'] = 0.0
+            
+            # Reorder columns to match expected format
+            label_col = df['label']
+            df = df.drop('label', axis=1)
+            df['label'] = label_col
+            
+            print(f"   ✅ Migration complete! Now {len(df.columns)} columns")
+            
+            # Save migrated data
+            save_data(df)
+        
+        # Check if columns match now
         if list(df.columns) != expected_columns:
-            print(f"⚠️  Column mismatch detected!")
-            print(f"   File has {len(df.columns)} columns, expected {len(expected_columns)}")
-            print(f"   Creating backup and starting fresh...")
+            print(f"⚠️  Column mismatch!")
+            print(f"   File has: {len(df.columns)} columns")
+            print(f"   Expected: {len(expected_columns)} columns")
+            print(f"   File columns: {list(df.columns)[:5]}...{list(df.columns)[-5:]}")
+            print(f"   Expected: {expected_columns[:5]}...{expected_columns[-5:]}")
             
             # Backup old file
             backup_file = OUTPUT_FILE.replace('.csv', '_backup.csv')
@@ -190,7 +218,7 @@ def load_existing_data():
             max_id = df['sample_id'].max()
         else:
             max_id = -1
-        return df, max_id + 1
+        return df, int(max_id) + 1
     else:
         print("Starting with empty dataset")
         return pd.DataFrame(columns=expected_columns), 0
@@ -236,7 +264,9 @@ def delete_last_sample(df, letter):
 def show_preview(frames_data, letter):
     """
     Show animated preview of ALL finger movements + wrist.
-    frames_data is a list of 66-value lists (from recording buffer)
+    frames_data is a list of 66-value lists:
+    - [0:63] = 21 landmarks relative to wrist
+    - [63:66] = absolute wrist position
     """
     if len(frames_data) < 5:
         print("   Not enough frames to preview")
@@ -248,25 +278,26 @@ def show_preview(frames_data, letter):
     frames_arr = np.array(frames_data)
     
     # Data format: 66 values
-    # [0:3] = absolute wrist (x, y, z)
-    # [3:66] = 21 landmarks relative to wrist
+    # [0:63] = 21 landmarks relative to wrist
+    # [63:66] = absolute wrist (x, y, z)
     
-    # Extract ALL fingertip trajectories (relative to wrist, so add wrist position back)
+    # Extract absolute wrist positions (at the END of each row)
+    wrist_abs_x = frames_arr[:, 63]
+    wrist_abs_y = frames_arr[:, 64]
+    
+    # Extract ALL fingertip trajectories
     paths = {}
     
-    # Get absolute wrist positions
-    wrist_x = frames_arr[:, 0]
-    wrist_y = frames_arr[:, 1]
-    paths['Wrist'] = list(zip(wrist_x, wrist_y))
+    # Add wrist path (absolute position - important for H!)
+    paths['Wrist'] = list(zip(wrist_abs_x, wrist_abs_y))
     
-    # Get fingertip positions (relative + wrist = absolute for display)
+    # Get fingertip positions (relative + absolute wrist = absolute for display)
     for name, idx in FINGERTIP_INDICES.items():
-        # Relative positions start at index 3
-        rel_x = frames_arr[:, 3 + idx * 3]
-        rel_y = frames_arr[:, 3 + idx * 3 + 1]
+        rel_x = frames_arr[:, idx * 3]      # relative x
+        rel_y = frames_arr[:, idx * 3 + 1]  # relative y
         # Convert to absolute for display
-        abs_x = rel_x + wrist_x
-        abs_y = rel_y + wrist_y
+        abs_x = rel_x + wrist_abs_x
+        abs_y = rel_y + wrist_abs_y
         paths[name] = list(zip(abs_x, abs_y))
     
     # Find bounds for normalization
@@ -307,7 +338,7 @@ def show_preview(frames_data, letter):
         
         letter_type = "DYNAMIC" if letter in DYNAMIC_LETTERS else "STATIC"
         cv2.putText(frame, f"{letter_type} - ALL fingers + WRIST tracked", (20, 60),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1)
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.45, (150, 150, 150), 1)
         
         # Draw each path's trail
         for name, screen_path in screen_paths.items():
@@ -604,10 +635,12 @@ def main():
     print(f"   Letters complete: {total_complete}/26")
     print()
     
-    # Initialize camera
+    # Initialize camera with settings optimized for motion tracking
     cap = cv2.VideoCapture(0)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)   # Full HD width
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)   # Full HD height
+    cap.set(cv2.CAP_PROP_FPS, 30)             # Set to 30 FPS
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)       # Reduce buffer for less lag
     
     if not cap.isOpened():
         print("❌ Error: Could not open webcam")
@@ -619,6 +652,7 @@ def main():
     frames_buffer = []
     last_frames = []  # Store last recording for preview
     saved_timer = 0
+    lost_frames = 0   # Counter for frames without hand detection
     
     print("✅ Ready! Select a letter to begin.\n")
     
@@ -651,7 +685,7 @@ def main():
             # Check if we have enough frames
             frame_req = get_frame_count(current_letter)
             if len(frames_buffer) >= frame_req:
-                # Save sample
+                # Save sample to DataFrame
                 for frame_id, lm in enumerate(frames_buffer):
                     row = [next_sample_id, frame_id] + lm + [current_letter]
                     df.loc[len(df)] = row
@@ -666,6 +700,9 @@ def main():
                 print(f"   ✅ Saved {current_letter} sample #{count} ({len(frames_buffer)} frames)")
                 print(f"   💡 Press P to preview")
                 
+                # AUTO-SAVE to CSV after each sample (so you don't lose data!)
+                save_data(df)
+                
                 frames_buffer = []
                 state = "SAVED"
                 saved_timer = 30  # Show "SAVED" for ~1 second
@@ -676,11 +713,18 @@ def main():
             if saved_timer <= 0:
                 state = "WAITING"
         
-        # Handle lost hand during recording
+        # Handle lost hand during recording - allow MORE loss for fast motion
         if state == "RECORDING" and not hand_detected:
-            print("   ⚠️  Hand lost! Recording cancelled.")
-            frames_buffer = []
-            state = "WAITING"
+            lost_frames += 1
+            
+            # Only cancel after 30 consecutive frames of no hand (~1 sec)
+            if lost_frames > 30:
+                print("   ⚠️  Hand lost for too long! Recording cancelled.")
+                frames_buffer = []
+                state = "WAITING"
+                lost_frames = 0
+        elif hand_detected:
+            lost_frames = 0  # Reset counter when hand is found
         
         # Draw UI
         frame = draw_ui(frame, state, current_letter, sample_counts, 
@@ -695,17 +739,50 @@ def main():
         if key == ord('q'):
             break
         
-        elif key == ord(' '):  # SPACE - Start recording
-            if current_letter and hand_detected and state == "WAITING":
+        elif key == ord(' '):  # SPACE - Start/Stop recording
+            if state == "RECORDING":
+                # STOP recording manually (before auto-stop)
+                print(f"   ⏹️  Stopped manually ({len(frames_buffer)} frames)")
+                
+                # Need minimum frames
+                min_frames = 15
+                if len(frames_buffer) >= min_frames:
+                    # Save sample to DataFrame
+                    for frame_id, lm in enumerate(frames_buffer):
+                        row = [next_sample_id, frame_id] + list(lm) + [current_letter]
+                        df.loc[len(df)] = row
+                    
+                    # Store for preview
+                    last_frames = frames_buffer.copy()
+                    
+                    next_sample_id += 1
+                    sample_counts = get_sample_counts(df)
+                    
+                    count = sample_counts.get(current_letter, 0)
+                    print(f"   ✅ Saved {current_letter} sample #{count} ({len(frames_buffer)} frames)")
+                    print(f"   💡 Press P to preview")
+                    
+                    # AUTO-SAVE to CSV
+                    save_data(df)
+                    
+                    state = "SAVED"
+                    saved_timer = 30
+                else:
+                    print(f"   ❌ Too short! Need at least {min_frames} frames")
+                    state = "WAITING"
+                
+                frames_buffer = []
+                
+            elif current_letter and hand_detected and state == "WAITING":
+                # START recording
                 state = "RECORDING"
                 frames_buffer = []
-                print(f"\n   🔴 Recording {current_letter}...")
+                frame_req = get_frame_count(current_letter)
+                print(f"\n   🔴 Recording {current_letter}... (SPACE to stop, or auto-stops at {frame_req} frames)")
             elif not current_letter:
                 print("   ⚠️  Select a letter first!")
             elif not hand_detected:
                 print("   ⚠️  Show your hand first!")
-            elif state == "RECORDING":
-                print("   ⚠️  Already recording!")
         
         elif key == ord('r'):  # R - Delete last sample
             if current_letter:
