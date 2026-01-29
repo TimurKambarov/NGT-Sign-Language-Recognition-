@@ -1,85 +1,51 @@
-"""
-NGT Sign Language Recognition - Data Collection Module
-Collects hand landmark sequences for training the classifier.
-
-Controls:
-    A-Y keys  : Select letter directly 
-    SPACE     : Record 100 frames
-    1         : Quit and save
-    2         : Toggle signing zone on/off
-    3         : Toggle mirror mode
-    4         : Show guide for current letter
-    5         : Reset dataset 
-
-Output:
-    - data/samples.csv: All collected samples
-    - Format: 100 rows per sample with sample_id, frame_id, 63 features (21 × 3), label
-"""
-
 import cv2
 import numpy as np
 import pandas as pd
 import os
-from datetime import datetime
-
-try:
-    import hand_face_detection as detection
-except ImportError:
-    print("Error: hand_face_detection.py not found in current directory.")
-    print("Make sure you're running from the repository root.")
-    exit(1)
-
-try:
-    from guide import show_guide
-except ImportError:
-    print("Warning: guide.py not found. Letter guides will be unavailable.")
-    show_guide = None
+import time
+import hand_face_detection as detection
+from guide import show_guide
 
 
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
 
-# Output settings
+# Configuration
+
 DATA_DIR = "data"
 OUTPUT_FILE = os.path.join(DATA_DIR, "samples.csv")
 
-# Recording settings
-FRAMES_PER_SAMPLE = 30  # Number of frames to record per sample (~3 sec at 30fps)
+FRAMES_STATIC = 30
+FRAMES_DYNAMIC = 75
 
-# Static letters only (excluding dynamic: H, J, Z)
 STATIC_LETTERS = list("ABCDEFGIKLMNOPQRSTUVWXY")
+DYNAMIC_LETTERS = ['H', 'J', 'Z']
+ALL_LETTERS = sorted(STATIC_LETTERS + DYNAMIC_LETTERS)
 
-# Letters per row in the UI display
-LETTERS_PER_ROW = 8
+CONTINUOUS_SAMPLES_STATIC = 50
+CONTINUOUS_SAMPLES_DYNAMIC = 100
+CONTINUOUS_COUNTDOWN = 3
+CONTINUOUS_PAUSE = 1.0
 
-# Signing zone boundaries (relative to face)
-SIGNING_ZONE = {
-    'x_min': -2.5,
-    'x_max': 2.5,
-    'y_min': -0.7,
-    'y_max': 1.7,
-}
+LETTERS_PER_ROW = 9
 
-# Colors
 COLOR_GREEN = (0, 255, 0)
 COLOR_RED = (0, 0, 255)
 COLOR_YELLOW = (0, 255, 255)
 COLOR_WHITE = (255, 255, 255)
 COLOR_CYAN = (255, 255, 0)
 COLOR_ORANGE = (0, 165, 255)
+COLOR_BLUE = (255, 0, 0)
 
 
-# =============================================================================
-# DATA MANAGEMENT
-# =============================================================================
+# Data Management
 
 def create_column_names():
     """
-    Create column names for the CSV.
-    Format: sample_id, frame_id, x0, y0, z0, x1, y1, z1, ..., x20, y20, z20, label
+    Create column names for the CSV
+    Format: sample_id, frame_id, wrist_abs_x, wrist_abs_y, wrist_abs_z,
+            x0, y0, z0, x1, y1, z1, ..., x20, y20, z20, label
+    Total: 69 columns
     """
-    columns = ['sample_id', 'frame_id']
+    columns = ['sample_id', 'frame_id', 'wrist_abs_x', 'wrist_abs_y', 'wrist_abs_z']
     for i in range(21):
         columns.append(f"x{i}")
         columns.append(f"y{i}")
@@ -88,30 +54,37 @@ def create_column_names():
     return columns
 
 
-def landmarks_to_row(landmarks_normalized, sample_id, frame_id, label):
+def landmarks_to_row(landmarks_normalized, landmarks_absolute, sample_id, frame_id, label):
     """
-    Convert normalized landmarks to a flat row for CSV.
+    Convert landmarks to a flat row for CSV
     
     Args:
-        landmarks_normalized: List of 21 dicts with 'x', 'y', 'z' keys
+        landmarks_normalized: List of 21 dicts with normalized x, y, z (relative to wrist)
+        landmarks_absolute: List of 21 dicts with absolute x, y, z (original values)
         sample_id: Unique identifier for this sample
-        frame_id: Frame number within the sample (0-99)
-        label: Letter label (e.g., 'A')
+        frame_id: Frame number within the sample
+        label: Letter label
     
     Returns:
-        List of values: [sample_id, frame_id, x0, y0, z0, ..., x20, y20, z20, label]
+        List: [sample_id, frame_id, wrist_abs_x, wrist_abs_y, wrist_abs_z, 
+               x0, y0, z0, ..., x20, y20, z20, label]
     """
     row = [sample_id, frame_id]
+    
+    # Add absolute wrist position (landmark 0 before normalization)
+    wrist_abs = landmarks_absolute[0]
+    row.extend([wrist_abs['x'], wrist_abs['y'], wrist_abs['z']])
+    
+    # Add normalized landmarks
     for lm in landmarks_normalized:
-        row.append(lm['x'])
-        row.append(lm['y'])
-        row.append(lm['z'])
+        row.extend([lm['x'], lm['y'], lm['z']])
+    
     row.append(label)
     return row
 
 
 def load_existing_data(filepath):
-    """Load existing CSV data or create empty DataFrame."""
+    """Load existing CSV data or create empty DataFrame"""
     if os.path.exists(filepath):
         df = pd.read_csv(filepath)
         print(f"Loaded {len(df)} existing rows from {filepath}")
@@ -123,30 +96,29 @@ def load_existing_data(filepath):
 
 
 def save_data(df, filepath):
-    """Save DataFrame to CSV."""
+    """Save DataFrame to CSV"""
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
     df.to_csv(filepath, index=False)
     print(f"Saved {len(df)} rows to {filepath}")
 
 
 def get_next_sample_id(df):
-    """Get the next available sample_id."""
+    """Get the next available sample_id"""
     if len(df) == 0:
         return 0
     return df['sample_id'].max() + 1
 
 
 def get_sample_counts(df):
-    """Get count of complete samples per letter."""
+    """Get count of complete samples per letter"""
     if len(df) == 0:
         return {}
-    # Count unique sample_ids per label
     samples_per_label = df.groupby('label')['sample_id'].nunique()
     return samples_per_label.to_dict()
 
 
 def reset_dataset(filepath):
-    """Delete existing dataset and create empty one."""
+    """Delete existing dataset and create empty one"""
     if os.path.exists(filepath):
         os.remove(filepath)
         print(f"Deleted {filepath}")
@@ -154,65 +126,25 @@ def reset_dataset(filepath):
     df = pd.DataFrame(columns=columns)
     return df
 
-
-# =============================================================================
-# SIGNING ZONE CHECK
-# =============================================================================
-
-def is_in_signing_zone(relative_position):
-    """Check if hand is within the signing zone."""
-    if relative_position is None:
-        return False
-    
-    x = relative_position['rel_x']
-    y = relative_position['rel_y']
-    
-    return (SIGNING_ZONE['x_min'] <= x <= SIGNING_ZONE['x_max'] and
-            SIGNING_ZONE['y_min'] <= y <= SIGNING_ZONE['y_max'])
-
-
-# =============================================================================
-# UI DRAWING
-# =============================================================================
-
-def draw_signing_zone(frame, face_refs, show_zone=True):
-    """Draw signing zone rectangle based on face position."""
-    if not show_zone or face_refs is None:
-        return frame
-    
-    nose = face_refs['nose']
-    fw = face_refs['face_width']
-    fh = face_refs['face_height']
-    
-    x1 = int(nose[0] + SIGNING_ZONE['x_min'] * fw)
-    x2 = int(nose[0] + SIGNING_ZONE['x_max'] * fw)
-    y1 = int(nose[1] + SIGNING_ZONE['y_min'] * fh)
-    y2 = int(nose[1] + SIGNING_ZONE['y_max'] * fh)
-    
-    cv2.rectangle(frame, (x1, y1), (x2, y2), COLOR_YELLOW, 2)
-    
-    return frame
-
-
 def draw_letter_selector(frame, current_letter, sample_counts):
-    """Draw the letter selection UI on the frame."""
+    """Draw letter selection UI"""
     h, w, _ = frame.shape
     
     # Background panel
-    panel_height = 180
+    panel_height = 200
     cv2.rectangle(frame, (10, h - panel_height - 10), (w - 10, h - 10), (0, 0, 0), -1)
     cv2.rectangle(frame, (10, h - panel_height - 10), (w - 10, h - 10), COLOR_WHITE, 2)
     
-    # Title
-    cv2.putText(frame, "Press letter key to select | SPACE=record | 1=quit | 2=zone | 3=mirror | 4=guide | 5=reset",
-               (20, h - panel_height + 15), cv2.FONT_HERSHEY_SIMPLEX, 0.4, COLOR_WHITE, 1)
+    # Title with controls
+    cv2.putText(frame, "Letter | SPACE=record | 1=quit | 2=reset | 3=guide | 4=continuous",
+               (20, h - panel_height + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.45, COLOR_WHITE, 1)
     
     # Draw letters in grid
-    start_y = h - panel_height + 40
-    box_size = 35
-    margin = 5
+    start_y = h - panel_height + 45
+    box_size = 32
+    margin = 4
     
-    for idx, letter in enumerate(STATIC_LETTERS):
+    for idx, letter in enumerate(ALL_LETTERS):
         row = idx // LETTERS_PER_ROW
         col = idx % LETTERS_PER_ROW
         
@@ -224,117 +156,346 @@ def draw_letter_selector(frame, current_letter, sample_counts):
             cv2.rectangle(frame, (x, y), (x + box_size, y + box_size), COLOR_GREEN, -1)
             text_color = (0, 0, 0)
         else:
-            cv2.rectangle(frame, (x, y), (x + box_size, y + box_size), COLOR_WHITE, 1)
+            # Color code: blue for dynamic, white for static
+            border_color = COLOR_BLUE if letter in DYNAMIC_LETTERS else COLOR_WHITE
+            cv2.rectangle(frame, (x, y), (x + box_size, y + box_size), border_color, 1)
             text_color = COLOR_WHITE
         
         # Letter
-        cv2.putText(frame, letter, (x + 10, y + 25), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, text_color, 2)
+        cv2.putText(frame, letter, (x + 8, y + 22), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_color, 2)
         
-        # Sample count (small, below letter)
+        # Sample count
         count = sample_counts.get(letter, 0)
-        cv2.putText(frame, str(count), (x + 12, y + box_size - 3),
+        cv2.putText(frame, str(count), (x + 10, y + box_size - 3),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.3, COLOR_CYAN, 1)
     
     return frame
 
 
-def draw_status(frame, current_letter, sample_counts, hand_in_zone, is_recording, frames_recorded, mirrored, show_zone):
-    """Draw status information at the top of the frame."""
+def draw_status(frame, current_letter, sample_counts, is_recording, frames_recorded, 
+                total_frames, continuous_mode=False, continuous_count=0):
+    """Draw status information"""
     h, w, _ = frame.shape
     
-    # Current letter and count
     count = sample_counts.get(current_letter, 0)
+    is_dynamic = current_letter in DYNAMIC_LETTERS
     
     if is_recording:
-        # Recording mode
         status_color = COLOR_ORANGE
-        status_text = f"RECORDING: {current_letter} | Frame: {frames_recorded}/{FRAMES_PER_SAMPLE}"
-        zone_text = "Hold still..."
+        if continuous_mode:
+            status_text = f"CONTINUOUS: {current_letter} | Sample {continuous_count}"
+        else:
+            status_text = f"RECORDING: {current_letter} | Frame: {frames_recorded}/{total_frames}"
+        zone_text = "Hold steady..." if not is_dynamic else "Perform gesture..."
         
-        # Progress bar
-        progress = frames_recorded / FRAMES_PER_SAMPLE
+        progress = frames_recorded / total_frames
         bar_width = 400
         cv2.rectangle(frame, (20, 75), (20 + bar_width, 90), (50, 50, 50), -1)
         cv2.rectangle(frame, (20, 75), (20 + int(bar_width * progress), 90), COLOR_ORANGE, -1)
     else:
-        # Normal mode
-        status_text = f"Selected: {current_letter} | Samples: {count}"
-        
-        if hand_in_zone:
-            status_color = COLOR_GREEN
-            zone_text = "READY - Press SPACE to record"
-        else:
-            status_color = COLOR_RED
-            zone_text = "Move hand into signing zone"
+        gesture_type = "DYNAMIC" if is_dynamic else "STATIC"
+        frames_info = f"{FRAMES_DYNAMIC}f" if is_dynamic else f"{FRAMES_STATIC}f"
+        status_text = f"Selected: {current_letter} [{gesture_type}] | Samples: {count} | Frames: {frames_info}"
+        zone_text = "Press SPACE to record | Press 4 for continuous"
+        status_color = COLOR_GREEN
     
-    # Background
-    cv2.rectangle(frame, (10, 10), (500, 100), (0, 0, 0), -1)
-    cv2.rectangle(frame, (10, 10), (500, 100), status_color, 2)
+    cv2.rectangle(frame, (10, 10), (650, 100), (0, 0, 0), -1)
+    cv2.rectangle(frame, (10, 10), (650, 100), status_color, 2)
     
-    # Text
     cv2.putText(frame, status_text, (20, 35),
-               cv2.FONT_HERSHEY_SIMPLEX, 0.6, status_color, 2)
+               cv2.FONT_HERSHEY_SIMPLEX, 0.55, status_color, 2)
     cv2.putText(frame, zone_text, (20, 58),
                cv2.FONT_HERSHEY_SIMPLEX, 0.5, status_color, 1)
     
-    # Settings indicators
-    settings_text = f"Mirror: {'ON' if mirrored else 'OFF'} | Zone: {'ON' if show_zone else 'OFF'}"
-    cv2.putText(frame, settings_text, (300, 35),
-               cv2.FONT_HERSHEY_SIMPLEX, 0.4, COLOR_WHITE, 1)
-    
-    # Total samples (top right of status box)
     total = sum(sample_counts.values())
-    cv2.putText(frame, f"Total: {total}", (420, 58),
+    cv2.putText(frame, f"Total: {total}", (560, 35),
                cv2.FONT_HERSHEY_SIMPLEX, 0.5, COLOR_WHITE, 1)
     
     return frame
 
 
-# =============================================================================
-# KEY MAPPING
-# =============================================================================
+def draw_pause_message(frame, completed, total):
+    """Draw pause message between continuous recordings"""
+    h, w, _ = frame.shape
+    
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (w//4, h//3), (3*w//4, 2*h//3), (0, 0, 0), -1)
+    frame = cv2.addWeighted(frame, 0.5, overlay, 0.5, 0)
+    cv2.rectangle(frame, (w//4, h//3), (3*w//4, 2*h//3), COLOR_GREEN, 3)
+    
+    msg1 = f"Completed {completed} out of {total}"
+    msg2 = "Next recording starting..."
+    msg3 = "Press '1' to stop"
+    
+    cv2.putText(frame, msg1, (w//4 + 40, h//2 - 20),
+               cv2.FONT_HERSHEY_SIMPLEX, 1.0, COLOR_GREEN, 2)
+    cv2.putText(frame, msg2, (w//4 + 60, h//2 + 20),
+               cv2.FONT_HERSHEY_SIMPLEX, 0.7, COLOR_WHITE, 2)
+    cv2.putText(frame, msg3, (w//4 + 80, h//2 + 60),
+               cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLOR_YELLOW, 1)
+    
+    return frame
+
+
+def draw_countdown(frame, count):
+    """Draw countdown overlay"""
+    h, w, _ = frame.shape
+    
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (0, 0), (w, h), (0, 0, 0), -1)
+    frame = cv2.addWeighted(frame, 0.3, overlay, 0.7, 0)
+    
+    if count > 0:
+        cv2.putText(frame, str(count), (w//2 - 60, h//2 + 60),
+                   cv2.FONT_HERSHEY_SIMPLEX, 6, COLOR_YELLOW, 12)
+    else:
+        cv2.putText(frame, "GO!", (w//2 - 80, h//2 + 60),
+                   cv2.FONT_HERSHEY_SIMPLEX, 4, COLOR_GREEN, 10)
+    
+    return frame
+    """Draw countdown overlay"""
+    h, w, _ = frame.shape
+    
+    # Semi-transparent overlay
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (0, 0), (w, h), (0, 0, 0), -1)
+    frame = cv2.addWeighted(frame, 0.3, overlay, 0.7, 0)
+    
+    # Countdown number
+    if count > 0:
+        cv2.putText(frame, str(count), (w//2 - 60, h//2 + 60),
+                   cv2.FONT_HERSHEY_SIMPLEX, 6, COLOR_YELLOW, 12)
+    else:
+        cv2.putText(frame, "GO!", (w//2 - 80, h//2 + 60),
+                   cv2.FONT_HERSHEY_SIMPLEX, 4, COLOR_GREEN, 10)
+    
+    return frame
+
 
 def get_letter_from_key(key):
-    """
-    Map key press directly to letter.
-    
-    Args:
-        key: Key code from cv2.waitKey()
-    
-    Returns:
-        Uppercase letter if valid, None otherwise
-    """
-    # Convert to character
+    """Map key press to letter"""
     try:
         char = chr(key).upper()
     except:
         return None
     
-    # Check if it's a valid static letter
-    if char in STATIC_LETTERS:
+    if char in ALL_LETTERS:
         return char
     
     return None
 
+def record_single_sample(current_letter, next_sample_id, df, mp_resources, cap, mirrored):
+    """
+    Record a single sample
+    Returns: updated df, next_sample_id, success (bool)
+    """
+    is_dynamic = current_letter in DYNAMIC_LETTERS
+    total_frames = FRAMES_DYNAMIC if is_dynamic else FRAMES_STATIC
+    
+    recording_frames = []
+    frames_recorded = 0
+    
+    print(f"\nRecording {current_letter} ({total_frames} frames)...")
+    
+    while frames_recorded < total_frames:
+        ret, frame = cap.read()
+        if not ret:
+            return df, next_sample_id, False
+        
+        if mirrored:
+            frame = cv2.flip(frame, 1)
+        
+        # Process frame
+        frame, face_refs, hands_data = detection.process_frame(frame, mp_resources)
+        
+        # Check if hand detected
+        if hands_data and face_refs:
+            hand_data = hands_data[0]
+            
+            # Store both normalized and absolute landmarks
+            landmarks_norm = hand_data['landmarks_normalized']
+            landmarks_abs = hand_data['landmarks']
+            
+            recording_frames.append((landmarks_norm, landmarks_abs))
+            frames_recorded = len(recording_frames)
+            
+            # Draw recording status
+            frame = draw_status(frame, current_letter, {}, True, 
+                              frames_recorded, total_frames)
+        else:
+            # No hand detected - show warning
+            cv2.putText(frame, "HAND NOT DETECTED!", (400, 300),
+                       cv2.FONT_HERSHEY_SIMPLEX, 1.5, COLOR_RED, 3)
+        
+        cv2.imshow('NGT Data Collection', frame)
+        
+        # Allow quit during recording
+        if cv2.waitKey(1) & 0xFF == ord('1'):
+            print("Recording cancelled")
+            return df, next_sample_id, False
+    
+    # Save all frames
+    rows = []
+    for frame_id, (lm_norm, lm_abs) in enumerate(recording_frames):
+        row = landmarks_to_row(lm_norm, lm_abs, next_sample_id, frame_id, current_letter)
+        rows.append(row)
+    
+    # Add to DataFrame
+    new_rows = pd.DataFrame(rows, columns=create_column_names())
+    df = pd.concat([df, new_rows], ignore_index=True)
+    
+    print(f"✓ Saved: {current_letter} (sample_id: {next_sample_id})")
+    
+    return df, next_sample_id + 1, True
 
-# =============================================================================
-# MAIN
-# =============================================================================
+
+def record_continuous(current_letter, next_sample_id, df, sample_counts, 
+                     mp_resources, cap, mirrored):
+    """
+    Record multiple samples continuously with countdown
+    """
+    is_dynamic = current_letter in DYNAMIC_LETTERS
+    total_frames = FRAMES_DYNAMIC if is_dynamic else FRAMES_STATIC
+    total_samples = CONTINUOUS_SAMPLES_DYNAMIC if is_dynamic else CONTINUOUS_SAMPLES_STATIC
+    
+    print(f"\n{'='*60}")
+    print(f"CONTINUOUS RECORDING MODE")
+    print(f"Letter: {current_letter} ({'DYNAMIC' if is_dynamic else 'STATIC'})")
+    print(f"Samples to record: {total_samples}")
+    print(f"Frames per sample: {total_frames}")
+    print(f"Press '1' during recording to stop early")
+    print(f"{'='*60}\n")
+    
+    samples_recorded = 0
+    continuous_data = []  # Store samples temporarily
+    stopped_early = False
+    
+    for sample_num in range(total_samples):
+        print(f"\nSample {sample_num + 1}/{total_samples}")
+        
+        # Countdown
+        for countdown in range(CONTINUOUS_COUNTDOWN, 0, -1):
+            ret, frame = cap.read()
+            if not ret:
+                break
+            
+            if mirrored:
+                frame = cv2.flip(frame, 1)
+            
+            frame, _, _ = detection.process_frame(frame, mp_resources)
+            frame = draw_countdown(frame, countdown)
+            
+            cv2.imshow('NGT Data Collection', frame)
+            
+            # Check for stop during countdown
+            key = cv2.waitKey(1000) & 0xFF
+            if key == ord('1'):
+                stopped_early = True
+                break
+        
+        if stopped_early:
+            break
+        
+        # Show "GO!" briefly
+        ret, frame = cap.read()
+        if mirrored:
+            frame = cv2.flip(frame, 1)
+        frame, _, _ = detection.process_frame(frame, mp_resources)
+        frame = draw_countdown(frame, 0)
+        cv2.imshow('NGT Data Collection', frame)
+        cv2.waitKey(300)
+        
+        temp_df, temp_sample_id, success = record_single_sample(
+            current_letter, next_sample_id + samples_recorded, 
+            pd.DataFrame(columns=create_column_names()),
+            mp_resources, cap, mirrored
+        )
+        
+        if success:
+            continuous_data.append(temp_df)
+            samples_recorded += 1
+        
+        # Check for stop key during recording
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('1'):
+            stopped_early = True
+            break
+        
+        # Pause between samples (except last one)
+        if sample_num < total_samples - 1 and not stopped_early:
+            # Show completion message during pause
+            pause_start = time.time()
+            while time.time() - pause_start < CONTINUOUS_PAUSE:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                
+                if mirrored:
+                    frame = cv2.flip(frame, 1)
+                
+                frame, _, _ = detection.process_frame(frame, mp_resources)
+                frame = draw_pause_message(frame, samples_recorded, total_samples)
+                
+                cv2.imshow('NGT Data Collection', frame)
+                
+                # Check for stop during pause
+                key = cv2.waitKey(30) & 0xFF
+                if key == ord('1'):
+                    stopped_early = True
+                    break
+            
+            if stopped_early:
+                break
+    
+    # Handle early stop
+    if stopped_early:
+        print("\nWhat would you like to do?")
+        print("  1 - SAVE all recorded samples")
+        print("  2 - DISCARD all recorded samples")
+        
+        choice = input("Enter choice (1 or 2): ").strip()
+        
+        if choice == '1':
+            print(f"Saving {samples_recorded} samples...")
+            # Add all temporary data to main dataframe
+            for temp_df in continuous_data:
+                df = pd.concat([df, temp_df], ignore_index=True)
+            
+            sample_counts[current_letter] = sample_counts.get(current_letter, 0) + samples_recorded
+            next_sample_id += samples_recorded
+            print(f"Saved {samples_recorded} samples for letter {current_letter}")
+        elif choice == '2':
+            print(f"Discarding {samples_recorded} samples...")
+            continuous_data = []
+            print("All continuous recordings discarded")
+        else:
+            print("Invalid choice, hence discarding recordings.")
+            continuous_data = []
+    else:
+        # Completed all samples normally
+        print(f"\nContinuous recording complete: {samples_recorded} samples recorded")
+        
+        # Add all temporary data to main dataframe
+        for temp_df in continuous_data:
+            df = pd.concat([df, temp_df], ignore_index=True)
+        
+        sample_counts[current_letter] = sample_counts.get(current_letter, 0) + samples_recorded
+        next_sample_id += samples_recorded
+    
+    return df, next_sample_id, sample_counts
+
 
 def main():
-    """Main data collection loop."""
-
-    print(f"Output file: {OUTPUT_FILE}")
-    print(f"Frames per sample: {FRAMES_PER_SAMPLE}")
-    print(f"Features per frame: 63 (21 landmarks × 3 coordinates)")
-    print(f"Static letters: {', '.join(STATIC_LETTERS)}")
+    """Main data collection loop"""
     
-    # Initialize MediaPipe
+    print(f"Output file: {OUTPUT_FILE}")
+    print(f"Static letters: {', '.join(STATIC_LETTERS)} ({FRAMES_STATIC} frames)")
+    print(f"Dynamic letters: {', '.join(DYNAMIC_LETTERS)} ({FRAMES_DYNAMIC} frames)")
+    
     print("\nInitializing detection...")
     mp_resources = detection.initialize_mediapipe()
     
-    # Initialize webcam
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         print("Error: Could not open webcam.")
@@ -343,32 +504,21 @@ def main():
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
     
-    # Load existing data
     df = load_existing_data(OUTPUT_FILE)
     sample_counts = get_sample_counts(df)
     next_sample_id = get_next_sample_id(df)
     
-    # State
-    current_letter = STATIC_LETTERS[0]
+    current_letter = ALL_LETTERS[0]
     mirrored = True
-    show_zone = True
-    
-    # Recording state
     is_recording = False
-    recording_frames = []
-    frames_recorded = 0
-    
-    # Session stats
-    samples_this_session = 0
     
     print("\nReady! Controls:")
-    print("  A-Y      : Select letter directly")
-    print("  SPACE    : Record 100 frames")
+    print("  A-Z      : Select letter")
+    print("  SPACE    : Record single sample")
     print("  1        : Quit and save")
-    print("  2        : Toggle signing zone")
-    print("  3        : Toggle mirror mode")
-    print("  4        : Show guide for current letter")
-    print("  5        : Reset dataset")
+    print("  2        : Reset dataset")
+    print("  3        : Show guide")
+    print("  4        : Continuous recording (50 static / 100 dynamic)")
     print()
     
     while True:
@@ -379,154 +529,71 @@ def main():
         if mirrored:
             frame = cv2.flip(frame, 1)
         
-        # Process frame (detect face and hands)
         frame, face_refs, hands_data = detection.process_frame(frame, mp_resources)
         
-        # Draw signing zone
-        if face_refs:
-            frame = draw_signing_zone(frame, face_refs, show_zone)
-        
-        # Check if hand is in signing zone
-        hand_in_zone = False
-        current_hand_data = None
-        
-        if hands_data and face_refs:
-            for hand_data in hands_data:
-                rel_pos = hand_data.get('relative_position')
-                if rel_pos and is_in_signing_zone(rel_pos):
-                    hand_in_zone = True
-                    current_hand_data = hand_data
-                    break
-        
-        # Recording logic
-        if is_recording:
-            if hand_in_zone and current_hand_data:
-                # Capture frame
-                landmarks_norm = current_hand_data['landmarks_normalized']
-                recording_frames.append(landmarks_norm)
-                frames_recorded = len(recording_frames)
-                
-                # Check if recording complete
-                if frames_recorded >= FRAMES_PER_SAMPLE:
-                    # Save all frames
-                    rows = []
-                    for frame_id, landmarks in enumerate(recording_frames):
-                        row = landmarks_to_row(landmarks, next_sample_id, frame_id, current_letter)
-                        rows.append(row)
-                    
-                    # Add to DataFrame
-                    new_rows = pd.DataFrame(rows, columns=create_column_names())
-                    df = pd.concat([df, new_rows], ignore_index=True)
-                    
-                    # Update state
-                    sample_counts[current_letter] = sample_counts.get(current_letter, 0) + 1
-                    samples_this_session += 1
-                    next_sample_id += 1
-                    
-                    print(f"Saved: {current_letter} (sample_id: {next_sample_id - 1}, total for letter: {sample_counts[current_letter]})")
-                    
-                    # Reset recording
-                    is_recording = False
-                    recording_frames = []
-                    frames_recorded = 0
-            else:
-                # Hand left zone during recording - abort
-                print("Recording aborted: Hand left signing zone")
-                is_recording = False
-                recording_frames = []
-                frames_recorded = 0
-        
-        # Draw UI
         frame = draw_letter_selector(frame, current_letter, sample_counts)
-        frame = draw_status(frame, current_letter, sample_counts, hand_in_zone, 
-                           is_recording, frames_recorded, mirrored, show_zone)
+        frame = draw_status(frame, current_letter, sample_counts, False, 0, 0)
         
-        # Draw hand indicator
-        if current_hand_data:
-            center = current_hand_data['center_px']
-            color = COLOR_GREEN if hand_in_zone else COLOR_RED
-            cv2.circle(frame, center, 10, color, -1)
+        if hands_data:
+            center = hands_data[0]['center_px']
+            cv2.circle(frame, center, 10, COLOR_GREEN, -1)
         
         cv2.imshow('NGT Data Collection', frame)
         
-        # Handle input (only process non-recording keys when not recording)
         key = cv2.waitKey(1) & 0xFF
         
-        # Key: 1 = Quit
         if key == ord('1'):
-            if is_recording:
-                print("Recording in progress, please wait...")
-            else:
-                break
+            break
         
-        # Key: 2 = Toggle zone
-        elif key == ord('2') and not is_recording:
-            show_zone = not show_zone
-            print(f"Signing zone: {'ON' if show_zone else 'OFF'}")
-        
-        # Key: 3 = Toggle mirror
-        elif key == ord('3') and not is_recording:
-            mirrored = not mirrored
-            print(f"Mirror mode: {'ON' if mirrored else 'OFF'}")
-        
-        # Key: 4 = Show guide
-        elif key == ord('4') and not is_recording:
-            if show_guide:
-                print(f"Showing guide for: {current_letter}")
-                show_guide(current_letter)
-            else:
-                print("Guide not available (guide.py not found)")
-        
-        # Key: 5 = Reset dataset
-        elif key == ord('5') and not is_recording:
-            print("\n" + "=" * 60)
-            print("WARNING: This will delete all collected data!")
+        elif key == ord('2'):
+            print("\nWARNING: This will delete all collected data!")
             confirmation = input("Type 'reset' to confirm: ")
             if confirmation.strip().lower() == 'reset':
                 df = reset_dataset(OUTPUT_FILE)
                 sample_counts = {}
                 next_sample_id = 0
-                samples_this_session = 0
                 print("Dataset reset successfully!")
             else:
                 print("Reset cancelled.")
         
-        # Key: SPACE = Start recording
-        elif key == ord(' ') and not is_recording:
-            if hand_in_zone and current_hand_data:
-                is_recording = True
-                recording_frames = []
-                frames_recorded = 0
-                print(f"Recording started for letter: {current_letter}")
-            else:
-                print("Cannot record: Hand not in signing zone")
+        elif key == ord('3'):
+            print(f"Showing guide for: {current_letter}")
+            show_guide(current_letter)
         
-        # Letter keys = Select letter
-        elif not is_recording:
+        elif key == ord('4'):
+            print(f"Starting continuous recording for letter: {current_letter}")
+            df, next_sample_id, sample_counts = record_continuous(
+                current_letter, next_sample_id, df, sample_counts,
+                mp_resources, cap, mirrored
+            )
+        
+        elif key == ord(' '):
+            df, next_sample_id, success = record_single_sample(
+                current_letter, next_sample_id, df, mp_resources, cap, mirrored
+            )
+            if success:
+                sample_counts[current_letter] = sample_counts.get(current_letter, 0) + 1
+        
+        else:
             new_letter = get_letter_from_key(key)
             if new_letter:
                 current_letter = new_letter
-                print(f"Selected letter: {current_letter}")
+                print(f"Selected letter: {current_letter} ({'DYNAMIC' if new_letter in DYNAMIC_LETTERS else 'STATIC'})")
     
-    # Cleanup
     cap.release()
     cv2.destroyAllWindows()
     mp_resources['hands'].close()
     mp_resources['face_mesh'].close()
     
-    # Save data
-    if samples_this_session > 0:
-        save_data(df, OUTPUT_FILE)
-        print(f"\nSession complete: {samples_this_session} new samples collected")
-    else:
-        print("\nNo new samples collected")
+    save_data(df, OUTPUT_FILE)
     
-    # Print summary
+    print("\nSession complete")
     print("\nSample counts per letter:")
-    for letter in STATIC_LETTERS:
+    for letter in ALL_LETTERS:
         count = sample_counts.get(letter, 0)
+        letter_type = "DYN" if letter in DYNAMIC_LETTERS else "STA"
         bar = "█" * min(count, 20)
-        print(f"  {letter}: {count:3d} {bar}")
+        print(f"  {letter} [{letter_type}]: {count:3d} {bar}")
     
     total_rows = len(df)
     total_samples = sum(sample_counts.values())
