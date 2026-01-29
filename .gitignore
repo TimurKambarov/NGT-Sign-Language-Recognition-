@@ -1,2 +1,2 @@
-venv-ngt
-**/__pycache__/
+/venv-ngt
+/data
