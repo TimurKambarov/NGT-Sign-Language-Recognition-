@@ -1,31 +1,15 @@
-"""
-NGT Sign Language Recognition - Hand + Face Detection Module
-Detects hands and face to track hand position relative to body.
-
-Key Face Mesh landmarks used:
-    - Nose tip (1): Center reference point
-    - Chin (152): Lower face boundary
-    - Left ear (234): Left side reference
-    - Right ear (454): Right side reference
-    - Forehead (10): Upper face boundary
-
-Controls:
-    - Press 'q' to quit
-    - Press 'm' to toggle mirrored view
-    - Press 'z' to toggle signing zone visualization
-"""
+'''
+Detect hands and face to track hand position relative to body.
+'''
 
 import cv2
 import mediapipe as mp
 import numpy as np
 
 
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
+# Configuration
 
-# Signing zone boundaries (relative to face)
-# These define where the hand should be for proper NGT signing
+
 SIGNING_ZONE = {
     'x_min': -2.5,   # Left boundary (face widths from nose)
     'x_max': 2.5,    # Right boundary
@@ -42,9 +26,7 @@ COLOR_WHITE = (255, 255, 255)
 COLOR_ORANGE = (0, 165, 255)
 
 
-# =============================================================================
-# INITIALIZATION
-# =============================================================================
+# Initialization
 
 def initialize_mediapipe():
     """Initialize MediaPipe Hands and Face Mesh solutions."""
@@ -82,22 +64,11 @@ def initialize_mediapipe():
     }
 
 
-# =============================================================================
-# FACE PROCESSING
-# =============================================================================
+# Face processing
 
 def extract_face_references(face_landmarks, frame_width, frame_height):
     """
     Extract key face reference points for body-relative positioning.
-    
-    Returns dict with:
-        - nose: (x, y) pixel coordinates of nose tip
-        - chin: (x, y) pixel coordinates of chin
-        - left_ear: (x, y) pixel coordinates
-        - right_ear: (x, y) pixel coordinates
-        - forehead: (x, y) pixel coordinates
-        - face_width: estimated face width in pixels
-        - face_height: estimated face height in pixels
     """
     
     # Key landmark indices in Face Mesh (468 total landmarks)
@@ -161,20 +132,11 @@ def draw_face_references(frame, face_refs, show_zone=True):
     return frame
 
 
-# =============================================================================
-# HAND PROCESSING
-# =============================================================================
+# Hand processing
 
 def extract_hand_data(hand_landmarks, handedness, frame_width, frame_height):
     """
     Extract hand landmark data.
-    
-    Returns dict with:
-        - landmarks: list of 21 {id, x, y, z} dicts (normalized 0-1)
-        - landmarks_px: list of 21 (x, y) pixel coordinates
-        - wrist_px: (x, y) pixel coordinates of wrist
-        - center_px: (x, y) approximate center of hand
-        - handedness: 'Left' or 'Right'
     """
     
     landmarks = []
@@ -207,12 +169,6 @@ def extract_hand_data(hand_landmarks, handedness, frame_width, frame_height):
 def calculate_relative_position(hand_data, face_refs):
     """
     Calculate hand position relative to face.
-    
-    Returns dict with:
-        - rel_x: horizontal offset from nose (in face_widths, negative=left)
-        - rel_y: vertical offset from nose (in face_heights, negative=above)
-        - distance_to_nose: Euclidean distance to nose (in face_widths)
-        - in_signing_zone: boolean, True if hand is in proper position
     """
     
     hand_center = hand_data['center_px']
@@ -248,25 +204,18 @@ def normalize_landmarks_to_wrist(landmarks, include_z=True):
             'id': lm['id'],
             'x': lm['x'] - wrist['x'],
             'y': lm['y'] - wrist['y'],
-            'z': lm['z'] - wrist['z']  # Always included now
+            'z': lm['z'] - wrist['z']
         }
         normalized.append(norm_lm)
     
     return normalized
 
 
-# =============================================================================
-# MAIN PROCESSING
-# =============================================================================
+# Main processing
 
 def process_frame(frame, mp_resources):
     """
     Process a single frame: detect face and hands, calculate relative positions.
-    
-    Returns:
-        - frame: annotated frame
-        - face_refs: face reference data (or None)
-        - hands_data: list of hand data with relative positions (or empty list)
     """
     
     h, w, _ = frame.shape
@@ -368,15 +317,8 @@ def display_info(frame, face_detected, num_hands, mirrored, show_zone):
     
     return frame
 
-
-# =============================================================================
-# MAIN
-# =============================================================================
-
 def main():
-    """Main function to run hand + face detection."""
     
-    print("Initializing hand + face detection...")
     mp_resources = initialize_mediapipe()
     
     cap = cv2.VideoCapture(0)
@@ -388,7 +330,7 @@ def main():
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
     
     print("Ready!")
-    print("Controls: 'q'=quit, 'm'=mirror, 'z'=toggle zone")
+    print("Controls: 'Q'=quit, 'M'=mirror, 'Z'=toggle zone")
     
     mirrored = True
     show_zone = True
@@ -432,8 +374,6 @@ def main():
     mp_resources['hands'].close()
     mp_resources['face_mesh'].close()
     print("Stopped.")
-
-# Make file import-friendly
 
 if __name__ == "__main__":
     main()
