@@ -1,272 +1,195 @@
-# NGT Sign Language Recognition System
+# NGT Sign Language Recognition
 
-> 🚧 **Work in Progress** — This project is currently under active development
+A real-time sign language recognition system that uses computer vision and machine learning to recognize Nederlandse Gebarentaal (Dutch Sign Language) fingerspelling alphabet gestures.
 
 ## Project Overview
 
-This project aims to develop a real-time computer vision system for recognizing Dutch Sign Language (Nederlandse Gebarentaal - NGT) fingerspelling. The system captures hand gestures via camera input, processes them using machine learning techniques, and outputs the corresponding letters.
-
-### Goal
-
-Create an accessible learning tool that enables users to practice NGT fingerspelling and receive real-time feedback on their hand movements and positions. This tool is designed to support the approximately 30,000 people in the Netherlands who use NGT as their primary language.
+This project implements an automated sign language recognition system capable of interpreting hand gestures for all 26 letters of the alphabet in real-time. The system uses MediaPipe for hand detection and landmark extraction, combined with a Random Forest classifier for gesture classification.
 
 ### Key Features
 
-- ✅ Real-time hand detection using MediaPipe Hand Landmarks
-- ✅ Face mesh detection for body-relative hand positioning
-- ✅ Signing zone validation (ensures hand is at proper height)
-- ✅ Data collection module for building training dataset
-- ✅ Random Forest classifier with Optuna hyperparameter tuning
-- ✅ Real-time letter prediction with stabilization
-- 🔲 Dynamic letter support (H, J, Z)
-- 🔲 Word building from letters
-- 🔲 User-friendly interface
+- **Real-time Recognition**: Live webcam-based hand gesture detection and classification
+- **Complete Alphabet Support**: Recognizes all 26 letters (A-Z) of the NGT fingerspelling alphabet
+- **Robust Hand Tracking**: Uses MediaPipe for hand landmark detection
+- **Intelligent Zone Detection**: Defines optimal signing area relative to face position
+- **Interactive Interface**: Real-time visual feedback with confidence scores and status indicators
 
-## Repository Structure
+## Technical Architecture
 
-```
+### Components
 
-NGT-Sign-Language-Recognition/
-├── data/
-│   └── samples.csv              # Collected training data
-├── models/
-│   └── random_forest.joblib     # Trained model
-├── hand_face_detection.py       # Hand + face detection module
-├── data_collection.py           # Data collection script
-├── train_model.ipynb            # Model training notebook
-├── real_time_prediction.py      # Real-time prediction script
-├── requirements.txt             # pip dependencies
-├── environment.yml              # Conda environment
-├── .gitattributes
-└── README.md
-```
+1. **Hand and Face Detection** (`hand_face_detection.py`)
+   - Coordinate normalization and feature preparation
 
-## Quick Start
+2. **Model Training** (`train_model.ipynb`)
+   - Train and evaluate Random Forest Classifier model
 
-### 1. Clone the Repository
+3. **Data Collection** (`data_collection.py`)
+   - Collect all necessary hand-gestures data
 
-```bash
-git clone https://github.com/TimurKambarov/NGT-Sign-Language-Recognition.git
-cd NGT-Sign-Language-Recognition
-```
+4. **Real-time Prediction (no UI)** (`real_time_prediction.py`)
+   - Live webcam gesture recognition
 
-### 2. Install Dependencies
+5. **Real-time Prediction (with UI)** (`real_time_prediction.py`)
+   - Same as above, but with user interface
 
-**Option A: pip (venv)**
+### Model Performance
 
-```bash
-python -m venv venv
-source venv/bin/activate        # Windows: venv\Scripts\activate
-pip install -r requirements.txt
-```
+- **Algorithm**: Random Forest Classifier
+- **Features**: 66-dimensional feature vector (63 normalized landmarks + 3 absolute wrist coordinates)
+- **Accuracy**: >95% on test dataset, but lower during actual real-time detection
+- **Training Data**: Individual frame-based classification approach
+- **Optimization**: Hyperparameter tuning with Optuna (5-fold cross-validation)
 
-**Option B: Conda (recommended if pip fails or if you want to train/tune model)**
+## Installation & Setup
 
-```bash
-conda env create -f environment.yml
-conda activate ngt-sign
-```
+### Prerequisites
 
-### 3. Collect Training Data
+- Recommended Python 3.10 or higher
+- Webcam for real-time recognition
 
-```bash
-python data_collection.py
-```
+### Environment Setup
 
-Controls:
-- `0-9`, `a-n` — Select letter (numbers and letters act as indexes)
-- `SPACE` — Save sample
-- `q` — Quit and save
+1. **Clone the repository**:
+   ```bash
+   git clone https://github.com/TimurKambarov/NGT-Sign-Language-Recognition.git
+   cd NGT-Sign-Language-Recognition
+   ```
 
-### 4. Train the Model
+2. **Create virtual environment**:
+   ```bash
+   python -m venv venv
+   
+   # Windows
+   venv\Scripts\activate
+   
+   # macOS/Linux
+   source venv/bin/activate
+   ```
 
-Open `train_model.ipynb` in Jupyter and run all cells, or:
+3. **Install dependencies**:
+   ```bash
+   pip install -r requirements.txt
+   ```
 
-```bash
-jupyter notebook train_model.ipynb
-```
+## Usage
 
-### 5. Run Real-Time Prediction
+### Training the Model
+
+1. **Prepare training data**:
+   ```bash
+   python data_collection.py
+   ```
+
+2. **Train the model**:
+   ```bash
+   jupyter notebook train_model.ipynb
+   ```
+
+### Real-time Recognition
+
+Run the real-time recognition system:
 
 ```bash
 python real_time_prediction.py
 ```
 
-Controls:
-- `q` — Quit
-- `m` — Toggle mirror mode
-- `z` — Toggle signing zone
+### Controls
 
-## Technical Approach
+- **Q**: Quit application
+- **M**: Toggle mirror mode
+- **Z**: Toggle signing zone visibility
 
-### Detection Pipeline
 
-The system uses a two-model approach:
-
-| Model | Purpose |
-|-------|---------|
-| MediaPipe Hands | Detects 21 hand landmarks per hand |
-| MediaPipe Face Mesh | Establishes body reference points |
-
-### Why Face Detection?
-
-Proper NGT fingerspelling requires the hand at shoulder/face height. Face detection enables:
-- Hand position validation relative to body
-- Signing zone enforcement
-- Distance-invariant measurements
-
-### Landmark Normalization
-
-| Type | Purpose |
-|------|---------|
-| Wrist-relative | Hand shape recognition (position independent) |
-| Face-relative | Signing zone validation |
-
-### Classification
-
-- **Algorithm:** Random Forest
-- **Optimization:** Optuna (100 trials, 5-fold CV, stratified)
-- **Features:** 42 (21 landmarks × 2 coordinates)
-- **Stabilization:** 10 consecutive matching predictions required
-- **Confidence threshold:** 60%
-
-## File Descriptions
-
-### `hand_face_detection.py`
-
-Core detection module that:
-- Detects hands and face simultaneously
-- Calculates hand position relative to face
-- Normalizes landmarks relative to wrist
-- Validates signing zone positioning
-
-### `data_collection.py`
-
-Data collection interface that:
-- Displays letter selection grid
-- Shows real-time sample counts per letter
-- Saves landmarks to `data/samples.csv`
-- Enforces signing zone for quality data
-
-### `train_model.ipynb`
-
-Jupyter notebook that:
-- Loads collected data
-- Performs stratified train/test split
-- Runs Optuna hyperparameter optimization
-- Trains Random Forest classifier
-- Evaluates and saves model
-- Generates training report
-
-### `real_time_prediction.py`
-
-Real-time prediction script that:
-- Loads trained model
-- Predicts letters from hand landmarks
-- Stabilizes predictions (reduces flickering)
-- Displays results on screen and console
-- Enforces signing zone
-
-## Configuration
-
-Key parameters in `real_time_prediction.py`:
-
-```python
-STABILITY_THRESHOLD = 10    # Frames for stable prediction
-CONFIDENCE_THRESHOLD = 0.60 # Minimum confidence (60%)
-SIGNING_ZONE = {
-    'x_min': -2.5,          # Face widths from nose
-    'x_max': 2.5,
-    'y_min': -0.7,
-    'y_max': 1.7,
-}
-```
-
-## NGT Alphabet Reference
-
-### Static Letters (Currently Supported)
+## File Structure
 
 ```
-A B C D E F G I K L M N O P Q R S T U V W X Y
+NGT-Sign-Language-Recognition-/
+├── data/
+│   NGT_gestures/                # Hand gestures pictures
+│   └── samples.csv              # Training dataset
+├── models/
+│   ├── random_forest_model.joblib    # Trained RF model
+│   └── label_encoder_rf.pkl          # Label encoder
+├── hand_face_detection.py       # MediaPipe detection utilities
+├── real_time_prediction.py      # Main recognition application
+├── train_model.ipynb           # Model training notebook
+├── streamlit_app.py            # Data collection tool
+├── requirements.txt            # Python dependencies
+└── README.md                   # This file
 ```
 
-### Dynamic Letters (Planned)
+## Performance Metrics
 
-```
-H J Z (require movement)
-```
+The system achieves the following performance characteristics:
 
-### Hand Landmarks
+- **Accuracy**: >95% on test dataset, but ~40% confidence in real-time prediction
+- **Recognition Latency**: <100ms per prediction
+- **Supported Gestures**: All 26 letters (A-Z)
 
-```
-        8   12  16  20      ← Fingertips
-        |   |   |   |
-        7   11  15  19
-        |   |   |   |
-        6   10  14  18
-        |   |   |   |
-    4   5---9---13--17
-    |    \         /
-    3     \       /
-    |      \     /
-    2       \   /
-    |        \ /
-    1         0             ← Wrist
-```
+## Technical Details
 
-## Dependencies
+### Feature Engineering
 
-| Library | Purpose |
-|---------|---------|
-| opencv-python | Webcam, image processing |
-| mediapipe | Hand and face detection |
-| scikit-learn | Random Forest classifier |
-| optuna | Hyperparameter optimization |
-| numpy, pandas | Data handling |
-| joblib | Model serialization |
-| fastdtw | Dynamic letters (planned) |
+The system uses a 66-dimensional feature vector consisting of:
+- **63 normalized landmarks**: Hand keypoints relative to wrist position (21 points × 3 coordinates)
+- **3 absolute coordinates**: Wrist position for spatial context
 
-## Troubleshooting
+### Model Architecture
 
-| Problem | Solution |
-|---------|----------|
-| Metadata error with pip | Use Conda: `conda env create -f environment.yml` |
-| `conda` not found | Install [Miniconda](https://docs.conda.io/en/latest/miniconda.html) |
-| MediaPipe fails | Use Python 3.8-3.11 (not 3.12+) |
-| Webcam not detected | Check system camera permissions |
-| Model not found | Run `train_model.ipynb` first |
-| Low accuracy | Collect more training samples per letter |
-|  Kernel fails (jupyter notebook) | Use Conda: `conda install -n ngt-sign  ipykernel --update-deps --force-reinstall` |
+- **Algorithm**: Random Forest with optimized hyperparameters
+- **Training Strategy**: Per-frame classification approach
+- **Validation**: 5-fold cross-validation during hyperparameter tuning
+- **Optimization**: Optuna-based parameter search
 
-## Roadmap
+### Recognition Pipeline
 
-- [x] Hand detection with MediaPipe
-- [x] Face mesh for body-relative positioning
-- [x] Signing zone validation
-- [x] Data collection interface
-- [x] Model training pipeline with Optuna
-- [x] Real-time letter prediction
-- [ ] Dynamic letter support (H, J, Z)
-- [ ] Word building from letters
-- [ ] Left-hand support (mirroring)
-- [ ] UI
-- [ ] Feedback system for learning
+1. **Frame Capture**: Webcam video input
+2. **Face Detection**: Establish reference coordinate system
+3. **Hand Detection**: Extract 21 hand landmarks
+4. **Feature Extraction**: Normalize and prepare feature vector
+5. **Classification**: Random Forest prediction with confidence score
+6. **Post-processing**: Confidence filtering and temporal smoothing
 
-## References
+## Limitations
 
-- [NGT Alphabet Video](https://youtu.be/oZMyER7fWJY?si=HOpoH6l4ULbe_58W)
-- [NGT Signbank](https://signbank.cls.ru.nl/datasets/NGT/)
+### Current Model Constraints
 
-## Acknowledgments
+This implementation serves as a proof-of-concept and has several important limitations:
 
-- **Nienke Fluitman** — NGT Teacher and project stakeholder
-- **Irene van Blerck & Karna Rewatkar** — Project supervisors
-- **Breda University of Applied Sciences** — ADS&AI Program
+- **Limited Training Data**: The current model was trained on a relatively small dataset, which significantly impacts recognition accuracy
+- **Low Recognition Confidence**: Due to insufficient training samples, the model typically achieves confidence scores around 40% or lower
+- **Reduced Dynamic Gesture Performance**: Dynamic gestures (letters requiring movement) show even lower confidence scores compared to static hand positions
+- **Single User Bias**: Training data may be biased toward specific hand shapes, sizes, or signing styles
+- **Environmental Sensitivity**: Performance may vary significantly under different lighting conditions or camera angles
+
+### Recommended Improvements
+
+To achieve production-ready performance, the following enhancements are needed:
+- Collect substantially more training data (1000+ samples per letter from multiple users)
+- Include diverse hand sizes and signing styles in training data
+- Implement temporal smoothing and sequence-based recognition for dynamic gestures
+- Add data augmentation techniques to improve model robustness
+- Consider deep learning approaches for better feature extraction
+
+**Note**: The current confidence threshold is set to 55% for display purposes, but actual predictions often fall below this threshold due to the limited training data.
+
+## Contributing
+
+1. Fork the repository
+2. Create a feature branch (`git checkout -b feature/new-feature`)
+3. Commit your changes (`git commit -am 'Add new feature'`)
+4. Push to the branch (`git push origin feature/new-feature`)
+5. Create a Pull Request
 
 ## License
 
-*To be determined*
+This project is licensed under the MIT License - see the LICENSE file for details.
 
----
 
-*Part of the ADS&AI Sign Language Challenge at Breda University of Applied Sciences*
+## Future Enhancements
+
+- Support for word-level recognition
+- Web application development
+- Extended vocabulary beyond fingerspelling
+- Multi-hand gesture recognition
