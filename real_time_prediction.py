@@ -1,6 +1,5 @@
 import cv2
 import numpy as np
-import lightgbm as lgb
 import joblib
 import os
 from collections import deque
@@ -9,14 +8,14 @@ import hand_face_detection as detection
 
 # Configuration
 
-MODEL_PATH = "models/lightgbm_unified_model.txt"
-LABEL_ENCODER_PATH = "models/label_encoder_unified.pkl"
+MODEL_PATH = "models/random_forest_model.joblib"
+LABEL_ENCODER_PATH = "models/label_encoder_rf.pkl"
 
-SEQUENCE_LENGTH = 75
-MIN_FRAMES = 30
-PREDICTION_INTERVAL = 5
+SEQUENCE_LENGTH = 15  # Smaller buffer for RF stabilization
+MIN_FRAMES = 5
+PREDICTION_INTERVAL = 3
 
-CONFIDENCE_THRESHOLD = 0.70
+CONFIDENCE_THRESHOLD = 0.65
 
 SIGNING_ZONE = {
     'x_min': -2.5,
@@ -37,7 +36,7 @@ COLOR_ORANGE = (0, 165, 255)
 # Model Loading
 
 def load_model(model_path, label_encoder_path):
-    """Load unified LightGBM model"""
+    """Load trained Random Forest model"""
     
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Model not found: {model_path}")
@@ -45,10 +44,10 @@ def load_model(model_path, label_encoder_path):
     if not os.path.exists(label_encoder_path):
         raise FileNotFoundError(f"Label encoder not found: {label_encoder_path}")
     
-    model = lgb.Booster(model_file=model_path)
+    model = joblib.load(model_path)
     label_encoder = joblib.load(label_encoder_path)
     
-    print(f"Unified model loaded: {model_path}")
+    print(f"Random Forest model loaded: {model_path}")
     print(f"Supports {len(label_encoder.classes_)} letters: {list(label_encoder.classes_)}")
     
     return model, label_encoder
@@ -56,34 +55,13 @@ def load_model(model_path, label_encoder_path):
 
 # Feature Extraction
 
-def extract_unified_features(seq_norm, seq_wrist_abs):
-    """
-    Extract unified features for static + dynamic recognition
-    
-    Returns: 252 features
-    - 240 from normalized landmarks (mean, std, min, max for coords 3-62)
-    - 12 from absolute wrist positions (mean, std, min, max for x, y, z)
-    """
+def prepare_frame_features(landmarks_normalized):
+    """Flatten landmarks into a single feature row"""
     features = []
-    
-    # Normalized landmark statistics (skip x0, y0, z0)
-    for coord_idx in range(3, seq_norm.shape[1]):
-        coord_values = seq_norm[:, coord_idx]
-        
-        features.append(np.mean(coord_values))
-        features.append(np.std(coord_values))
-        features.append(np.min(coord_values))
-        features.append(np.max(coord_values))
-    
-    # Absolute wrist statistics (key for dynamic detection!)
-    for coord_idx in range(3):
-        wrist_coord = seq_wrist_abs[:, coord_idx]
-        
-        features.append(np.mean(wrist_coord))
-        features.append(np.std(wrist_coord))
-        features.append(np.min(wrist_coord))
-        features.append(np.max(wrist_coord))
-    
+    for lm in landmarks_normalized:
+        features.append(lm['x'])
+        features.append(lm['y'])
+        features.append(lm['z'])
     return np.array(features).reshape(1, -1)
 
 
@@ -134,17 +112,19 @@ class UnifiedSequenceBuffer:
 
 # Prediction
 
-def predict(model, seq_norm, seq_wrist_abs, label_encoder):
+def predict(model, landmarks_normalized, label_encoder):
     """
-    Predict letter using unified features
+    Predict letter using Random Forest
     Returns: (predicted_letter, confidence)
     """
     
-    features = extract_unified_features(seq_norm, seq_wrist_abs)
-    predictions = model.predict(features)[0]
+    features = prepare_frame_features(landmarks_normalized)
     
-    predicted_idx = np.argmax(predictions)
-    confidence = predictions[predicted_idx]
+    # Get probability across all classes
+    probabilities = model.predict_proba(features)[0]
+    
+    predicted_idx = np.argmax(probabilities)
+    confidence = probabilities[predicted_idx]
     predicted_letter = label_encoder.inverse_transform([predicted_idx])[0]
     
     return predicted_letter, confidence
@@ -234,7 +214,7 @@ def draw_status_bar(frame, face_ok, hand_ok, in_zone, mirrored, fps):
     status += f"Zone:{'OK' if in_zone else 'NO'} Mirror:{'ON' if mirrored else 'OFF'} FPS:{fps:.0f}"
     
     cv2.putText(frame, status, (15, h - 17), DISPLAY_FONT, 0.4, COLOR_WHITE, 1)
-    cv2.putText(frame, "Q=quit M=mirror Z=zone | Unified: Static+Dynamic", (280, h - 17), 
+    cv2.putText(frame, "Q=quit M=mirror Z=zone | RF: Static Letters", (280, h - 17), 
                DISPLAY_FONT, 0.35, (150, 150, 150), 1)
     
     return frame
@@ -271,9 +251,9 @@ def main():
     fps_counter = 0
     fps_start = cv2.getTickCount()
     
-    print("\nReady! Unified model recognizes all 26 letters")
+    print("\nReady! Random Forest model recognizes 23 static letters")
     print("Controls: Q=quit, M=mirror, Z=zone")
-    print("Automatically handles both static and dynamic gestures\n")
+    print("Supports static gestures only (excludes H, J, Z)\n")
     
     while True:
         ret, frame = cap.read()
@@ -303,18 +283,15 @@ def main():
                 
                 # Predict every N frames when buffer ready
                 if sequence_buffer.is_ready(MIN_FRAMES) and frame_count % PREDICTION_INTERVAL == 0:
-                    seq_norm, seq_wrist = sequence_buffer.get_sequences()
                     
-                    if seq_norm is not None:
-                        predicted_letter, confidence = predict(
-                            model, seq_norm, seq_wrist, label_encoder
-                        )
+                    predicted_letter, confidence = predict(
+                        model, hand_data['landmarks_normalized'], label_encoder
+                    )
+                    
+                    current_letter = predicted_letter
+                    current_confidence = confidence
                         
-                        current_letter = predicted_letter
-                        current_confidence = confidence
-                        
-                        if (predicted_letter != last_printed_letter and 
-                            confidence >= CONFIDENCE_THRESHOLD):
+                    if (predicted_letter != last_printed_letter and confidence >= CONFIDENCE_THRESHOLD):
                             print(f"Detected: {predicted_letter} ({confidence:.0%})")
                             last_printed_letter = predicted_letter
             else:
@@ -338,7 +315,7 @@ def main():
             color = COLOR_GREEN if in_zone else COLOR_RED
             cv2.circle(frame, center, 8, color, -1)
         
-        cv2.imshow('NGT Sign Language Recognition - Unified Model', frame)
+        cv2.imshow('NGT Sign Language Recognition - Random Forest', frame)
         
         frame_count += 1
         fps_counter += 1
