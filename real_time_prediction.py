@@ -1,3 +1,5 @@
+# Test real-time fingerspelling
+
 import cv2
 import numpy as np
 import joblib
@@ -33,7 +35,7 @@ COLOR_CYAN = (255, 255, 0)
 COLOR_ORANGE = (0, 165, 255)
 
 
-# Model Loading
+# Load model
 
 def load_model(model_path, label_encoder_path):
     """Load trained Random Forest model"""
@@ -55,13 +57,17 @@ def load_model(model_path, label_encoder_path):
 
 # Feature Extraction
 
-def prepare_frame_features(landmarks_normalized):
-    """Flatten landmarks into a single feature row"""
+def prepare_frame_features(landmarks_normalized, landmarks_absolute):
+    """Flatten landmarks into a single feature row (63 + 3 = 66)"""
     features = []
+    # 1. Add normalized landmarks (relative to wrist)
     for lm in landmarks_normalized:
-        features.append(lm['x'])
-        features.append(lm['y'])
-        features.append(lm['z'])
+        features.extend([lm['x'], lm['y'], lm['z']])
+    
+    # 2. Add absolute wrist position (landmark 0 before normalization)
+    wrist_abs = landmarks_absolute[0]
+    features.extend([wrist_abs['x'], wrist_abs['y'], wrist_abs['z']])
+    
     return np.array(features).reshape(1, -1)
 
 
@@ -112,13 +118,12 @@ class UnifiedSequenceBuffer:
 
 # Prediction
 
-def predict(model, landmarks_normalized, label_encoder):
+def predict(model, landmarks_normalized, landmarks_absolute, label_encoder):
     """
     Predict letter using Random Forest
-    Returns: (predicted_letter, confidence)
     """
     
-    features = prepare_frame_features(landmarks_normalized)
+    features = prepare_frame_features(landmarks_normalized, landmarks_absolute)
     
     # Get probability across all classes
     probabilities = model.predict_proba(features)[0]
@@ -214,11 +219,10 @@ def draw_status_bar(frame, face_ok, hand_ok, in_zone, mirrored, fps):
     status += f"Zone:{'OK' if in_zone else 'NO'} Mirror:{'ON' if mirrored else 'OFF'} FPS:{fps:.0f}"
     
     cv2.putText(frame, status, (15, h - 17), DISPLAY_FONT, 0.4, COLOR_WHITE, 1)
-    cv2.putText(frame, "Q=quit M=mirror Z=zone | RF: Static Letters", (280, h - 17), 
+    cv2.putText(frame, "Q=quit M=mirror Z=zone | RF: All 26 Letters", (280, h - 17), 
                DISPLAY_FONT, 0.35, (150, 150, 150), 1)
     
     return frame
-
 
 # Main
 
@@ -251,9 +255,9 @@ def main():
     fps_counter = 0
     fps_start = cv2.getTickCount()
     
-    print("\nReady! Random Forest model recognizes 23 static letters")
+    print("\nReady! Random Forest model recognizes all 26 letters")
     print("Controls: Q=quit, M=mirror, Z=zone")
-    print("Supports static gestures only (excludes H, J, Z)\n")
+    print("Supports both static and dynamic gestures\n")
     
     while True:
         ret, frame = cap.read()
@@ -285,7 +289,10 @@ def main():
                 if sequence_buffer.is_ready(MIN_FRAMES) and frame_count % PREDICTION_INTERVAL == 0:
                     
                     predicted_letter, confidence = predict(
-                        model, hand_data['landmarks_normalized'], label_encoder
+                        model, 
+                        hand_data['landmarks_normalized'], 
+                        hand_data['landmarks'],
+                        label_encoder
                     )
                     
                     current_letter = predicted_letter
